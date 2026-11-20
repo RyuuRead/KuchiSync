@@ -405,13 +405,15 @@ def _resolve_distinct_pair(
     """Apply Co-Articulation cross-fade or clean separation between distinct Shape Keys."""
     t_frames = max(0, int(transition_frames))
     gap = curr.s - prev.e
-    if gap > float(t_frames) + 1e-6:
+    mid = int(round(0.5 * (prev.i_end + curr.i_start)))
+
+    if co_art <= 0.0:
+        if gap <= float(t_frames) + 1e-6 or prev.release_zero > curr.pre_zero:
+            prev.release_zero = max(prev.last_active_frame + 1, min(prev.release_zero, mid))
+            curr.pre_zero = min(curr.attack - 1, max(curr.pre_zero, mid, prev.release_zero))
         return
 
-    mid = int(round(0.5 * (prev.i_end + curr.i_start)))
-    if co_art <= 0.0:
-        prev.release_zero = max(prev.last_active_frame + 1, min(prev.release_zero, mid))
-        curr.pre_zero = min(curr.attack - 1, max(curr.pre_zero, mid, prev.release_zero))
+    if gap > float(t_frames) + 1e-6:
         return
 
     overlap = max(1, round(float(t_frames) * co_art * 2.0))
@@ -703,15 +705,16 @@ def clear_lipsync_keyframes(
                 removed += count
             continue
 
-        to_remove = [
-            kp for kp in list(kps) if (f_min - 1e-6) <= float(kp.co[0]) <= (f_max + 1e-6)
-        ]
-        if to_remove:
-            for kp in reversed(to_remove):
+        removed_here = 0
+        for idx in range(len(kps) - 1, -1, -1):
+            kp = kps[idx]
+            if (f_min - 1e-6) <= float(kp.co[0]) <= (f_max + 1e-6):
                 kps.remove(kp, fast=True)
+                removed_here += 1
+        if removed_here:
             if callable(getattr(fc, "update", None)):
                 fc.update()
-            removed += len(to_remove)
+            removed += removed_here
 
     return removed
 
@@ -740,7 +743,7 @@ def apply_keyframes_to_object(
         return 0
 
     written = 0
-    written_shapes: set[str] = set()
+    written_frames_by_shape: dict[str, set[int]] = {}
     for shape_name, events in scheduled.items():
         if not events:
             continue
@@ -752,23 +755,31 @@ def apply_keyframes_to_object(
         if hasattr(kb, "slider_max") and max_val > float(kb.slider_max):
             kb.slider_max = min(1.5, max(float(kb.slider_max), round(max_val + 0.05, 2)))
 
+        frame_set = written_frames_by_shape.setdefault(shape_name, set())
         for ev in events:
+            frame_i = int(ev.frame)
             kb.value = float(ev.value)
-            kb.keyframe_insert(data_path="value", frame=int(ev.frame))
+            kb.keyframe_insert(data_path="value", frame=frame_i)
+            frame_set.add(frame_i)
             written += 1
-        written_shapes.add(shape_name)
 
-    if written_shapes:
+    if written_frames_by_shape:
         for fc in iter_shape_key_fcurves(shape_keys):
             kb_name = _extract_key_block_name(getattr(fc, "data_path", ""))
-            if kb_name not in written_shapes:
+            target_frames = written_frames_by_shape.get(kb_name)
+            if not target_frames:
                 continue
+            updated_any = False
             for kp in getattr(fc, "keyframe_points", ()):
-                kp.interpolation = mode
-                if mode == "BEZIER":
-                    kp.handle_left_type = "AUTO_CLAMPED"
-                    kp.handle_right_type = "AUTO_CLAMPED"
-            if callable(getattr(fc, "update", None)):
+                frame_f = float(kp.co[0])
+                frame_i = int(round(frame_f))
+                if abs(frame_f - frame_i) <= 1e-4 and frame_i in target_frames:
+                    kp.interpolation = mode
+                    if mode == "BEZIER":
+                        kp.handle_left_type = "AUTO_CLAMPED"
+                        kp.handle_right_type = "AUTO_CLAMPED"
+                    updated_any = True
+            if updated_any and callable(getattr(fc, "update", None)):
                 fc.update()
 
     return written
