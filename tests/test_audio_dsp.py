@@ -406,6 +406,43 @@ class TestAudioDsp(unittest.TestCase):
                     sys.modules.pop(k, None)
             audio_dsp.refresh_scipy()
 
+    def test_broad_damped_pole_is_filtered_from_formants(self):
+        sr = 16000
+        n = 400
+        y = np.zeros(n, dtype=np.float64)
+        y[150] = 1.0
+        for freq_hz, bw_hz in ((330.0, 90.0), (1200.0, 950.0), (2300.0, 110.0)):
+            radius = float(np.exp(-np.pi * bw_hz / sr))
+            theta = 2.0 * float(np.pi) * freq_hz / sr
+            a1 = -2.0 * radius * float(np.cos(theta))
+            a2 = radius * radius
+            out = np.zeros_like(y)
+            for i in range(n):
+                val = y[i]
+                if i >= 1:
+                    val -= a1 * out[i - 1]
+                if i >= 2:
+                    val -= a2 * out[i - 2]
+                out[i] = val
+            y = out
+
+        # Invert pre-emphasis (y[i] = x[i] - 0.97 * x[i - 1]) so LPC sees the exact 3-pole envelope.
+        x = np.zeros(n, dtype=np.float64)
+        x[0] = y[0]
+        for i in range(1, n):
+            x[i] = y[i] + 0.97 * x[i - 1]
+        x = (0.3 * x / np.max(np.abs(x))).astype(np.float32)
+
+        frames = audio_dsp.analyze_audio_frames(x, sr=sr, silence_threshold_db=-38.0)
+        self.assertEqual(len(frames), 1)
+        frame = frames[0]
+        self.assertTrue(frame.is_voiced)
+        self.assertIsNotNone(frame.f1)
+        self.assertIsNotNone(frame.f2)
+        self.assertAlmostEqual(frame.f1, 330.0, delta=30.0)
+        self.assertAlmostEqual(frame.f2, 2300.0, delta=60.0)
+        self.assertEqual(frame.vowel, "I")
+
 
 if __name__ == "__main__":
     unittest.main()
