@@ -131,7 +131,7 @@ def get_effective_transcript(props) -> str:
     return str(getattr(props, "transcript_text", "") or "").strip()
 
 
-def resolve_audio_path(filepath: str) -> str:
+def resolve_blender_path(filepath: str) -> str:
     """Resolve Blender // relative paths when bpy is available and normalize OS path."""
     raw = str(filepath or "").strip()
     if not raw:
@@ -248,13 +248,22 @@ def validate_generation_context(obj, props) -> tuple[bool, str]:
     raw_audio = str(getattr(props, "audio_filepath", "") or "").strip()
     if not raw_audio:
         return False, "Select an audio file."
-    resolved_audio = resolve_audio_path(raw_audio)
+    resolved_audio = resolve_blender_path(raw_audio)
     if not resolved_audio or not os.path.isfile(resolved_audio):
         return False, f"Audio file not found: {raw_audio}"
 
     mode = str(getattr(props, "detection_mode", "PURE_AUDIO") or "PURE_AUDIO").strip().upper()
-    if mode == "TRANSCRIPT" and not get_effective_transcript(props):
-        return False, "Enter a transcript or select a Text datablock."
+    if mode == "TRANSCRIPT":
+        effective = get_effective_transcript(props)
+        if not effective:
+            return False, "Enter a transcript or select a Text datablock."
+        if len(effective) <= MAX_LIVE_TRANSCRIPT_PREVIEW_CHARS:
+            try:
+                transcript_align.extract_vowels(
+                    effective, getattr(props, "language", "INDONESIAN")
+                )
+            except transcript_align.TranscriptError:
+                return False, "Transcript contains no extractable vowels."
 
     return True, "Ready to generate lip-sync keyframes."
 
@@ -293,12 +302,33 @@ def _read_install_log_tail() -> str:
             text = raw.decode("utf-8", errors="replace")
         else:
             text = str(raw)
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = [
+            ln.strip()
+            for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("[notice]")
+        ]
         if not lines:
             return ""
-        return lines[-1][:180]
+        error_lines = [ln for ln in lines if ln.startswith("ERROR:")]
+        chosen = error_lines[-1] if error_lines else lines[-1]
+        if len(chosen) > 180:
+            return f"{chosen[:60]}...{chosen[-117:]}"
+        return chosen
     except Exception:
         return ""
+
+
+def _format_scipy_error_label(err_msg: str, max_len: int = 90) -> str:
+    """Keep the failure prefix and trailing reason visible within panel label bounds."""
+    if len(err_msg) <= max_len:
+        return err_msg
+    prefix, sep, tail = err_msg.partition(": ")
+    if sep and len(prefix) <= 40:
+        avail = max(20, max_len - len(prefix) - 5)
+        return f"{prefix}: ...{tail[-avail:]}"
+    head = max(12, max_len // 3)
+    tail_len = max_len - head - 3
+    return f"{err_msg[:head]}...{err_msg[-tail_len:]}"
 
 
 def _redraw_view3d() -> None:
@@ -480,7 +510,6 @@ if bpy is not None:
             name="Audio File",
             description="Dialogue audio file (.wav, .mp3, .ogg, .flac)",
             default="",
-            subtype="FILE_PATH",
         )
         language: bpy.props.EnumProperty(
             name="Language",
@@ -644,11 +673,16 @@ if bpy is not None:
             options={"HIDDEN"},
         )
 
+        @classmethod
+        def poll(cls, context) -> bool:
+            scene = getattr(context, "scene", None)
+            return scene is not None and hasattr(scene, "kuchisync")
+
         def invoke(self, context, event):
             props = getattr(getattr(context, "scene", None), "kuchisync", None)
             if props is not None and not getattr(self, "filepath", ""):
                 current = str(getattr(props, "audio_filepath", "") or "").strip()
-                resolved = resolve_audio_path(current) if current else ""
+                resolved = resolve_blender_path(current) if current else ""
                 if resolved and os.path.exists(resolved):
                     self.filepath = resolved
             return super().invoke(context, event)
@@ -668,6 +702,11 @@ if bpy is not None:
         bl_label = "Use Current Frame"
         bl_description = "Set Start Frame to the current scene playhead frame"
         bl_options = {"REGISTER", "UNDO"}
+
+        @classmethod
+        def poll(cls, context) -> bool:
+            scene = getattr(context, "scene", None)
+            return scene is not None and hasattr(scene, "kuchisync")
 
         def execute(self, context):
             scene = getattr(context, "scene", None)
@@ -691,13 +730,18 @@ if bpy is not None:
             options={"HIDDEN"},
         )
 
+        @classmethod
+        def poll(cls, context) -> bool:
+            scene = getattr(context, "scene", None)
+            return scene is not None and hasattr(scene, "kuchisync")
+
         def execute(self, context):
             scene = getattr(context, "scene", None)
             if scene is None or not hasattr(scene, "kuchisync"):
                 self.report({"ERROR"}, "KuchiSync settings are unavailable.")
                 return {"CANCELLED"}
 
-            resolved = resolve_audio_path(self.filepath)
+            resolved = resolve_blender_path(self.filepath)
             if not resolved or not os.path.isfile(resolved):
                 self.report({"ERROR"}, f"Transcript file not found: {self.filepath}")
                 return {"CANCELLED"}
@@ -744,7 +788,7 @@ if bpy is not None:
                 self.report({"ERROR"}, msg)
                 return {"CANCELLED"}
 
-            audio_path = resolve_audio_path(props.audio_filepath)
+            audio_path = resolve_blender_path(props.audio_filepath)
             fps = _scene_fps(scene)
 
             try:
@@ -964,7 +1008,11 @@ if bpy is not None:
             _scipy_install_state["error_message"] = ""
 
             try:
-                bpy_mod.app.timers.register(_poll_scipy_install, first_interval=0.5)
+                bpy_mod.app.timers.register(
+                    _poll_scipy_install,
+                    first_interval=0.5,
+                    persistent=True,
+                )
             except Exception as exc:
                 _cleanup_scipy_installer()
                 return self._fail(f"Failed to register SciPy install timer: {exc}")
@@ -1094,7 +1142,7 @@ if bpy is not None:
 
             raw_audio = str(getattr(props, "audio_filepath", "") or "").strip()
             if raw_audio:
-                resolved = resolve_audio_path(raw_audio)
+                resolved = resolve_blender_path(raw_audio)
                 if not resolved or not os.path.isfile(resolved):
                     err_row = layout.row()
                     err_row.alert = True
@@ -1261,7 +1309,7 @@ if bpy is not None:
                     err_row = scipy_box.row()
                     err_row.alert = True
                     err_row.label(
-                        text=err_msg[:90],
+                        text=_format_scipy_error_label(err_msg),
                         icon=safe_icon("ERROR"),
                     )
 

@@ -903,7 +903,9 @@ def _english_word_syllables(word: str) -> list[tuple[str, ...]]:
         stem = letters[:-2]
         if _has_english_vowel(stem):
             voiced_ed = stem.endswith(("t", "d"))
-            if _is_single_magic_e_stem(stem):
+            if stem in _ENGLISH_ARPABET_LEXICON and not _is_single_magic_e_stem(stem):
+                base = _english_word_syllables(stem)
+            elif _is_single_magic_e_stem(stem):
                 base = _english_word_syllables(stem + "e")
             elif len(stem) >= 3 and stem[-1] == stem[-2] and stem[-1] not in _ENGLISH_VOWEL_CHARS:
                 base = _english_word_syllables(stem[:-1])
@@ -1483,7 +1485,7 @@ def align_transcript(
         voice_type="FEMALE_STANDARD",
         language=lang,
     )
-    norm_scores = audio_dsp.compute_speaker_normalized_scores(frames)
+    norm_scores = audio_dsp.compute_speaker_normalized_scores(frames, language=lang)
 
     matches = _match_phrases_to_islands(phrases, islands, env_db)
 

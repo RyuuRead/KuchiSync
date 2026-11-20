@@ -50,14 +50,24 @@ PANEL_IDS = (
 class _LayoutSpy:
     """Minimal UILayout probe to exercise Panel.draw() against real Blender RNA data."""
 
-    def __init__(self, calls: list[tuple[str, dict]] | None = None) -> None:
+    def __init__(
+        self,
+        calls: list[tuple[str, dict]] | None = None,
+        parent: "_LayoutSpy | None" = None,
+    ) -> None:
         self.calls = calls if calls is not None else []
+        self._parent = parent
         self.alert = False
         self.enabled = True
         self.scale_y = 1.0
 
+    def _effective_alert(self) -> bool:
+        if self._parent is not None:
+            return self.alert or self._parent._effective_alert()
+        return self.alert
+
     def _child(self) -> "_LayoutSpy":
-        return _LayoutSpy(self.calls)
+        return _LayoutSpy(self.calls, parent=self)
 
     def box(self) -> "_LayoutSpy":
         return self._child()
@@ -75,7 +85,7 @@ class _LayoutSpy:
         return self._child()
 
     def label(self, text: str = "", icon: str = "NONE") -> None:
-        self.calls.append(("label", {"text": text, "icon": icon}))
+        self.calls.append(("label", {"text": text, "icon": icon, "alert": self._effective_alert()}))
 
     def prop(self, data, prop_name: str, text: str = "", slider: bool = False, icon: str = "NONE") -> None:
         del slider
@@ -294,6 +304,7 @@ def _verify_icons_and_panels(kuchisync_mod) -> None:
     props = bpy.context.scene.kuchisync
     saved_mode = props.detection_mode
     saved_shape_i = props.shape_i
+    saved_audio = props.audio_filepath
     saved_active = bpy.context.view_layer.objects.active
     try:
         for mode in ("PURE_AUDIO", "TRANSCRIPT"):
@@ -309,14 +320,38 @@ def _verify_icons_and_panels(kuchisync_mod) -> None:
                     if icon_val != "NONE":
                         _assert(icon_val in enum_items, f"Panel {panel_id} emitted unknown icon {icon_val}")
 
-        # Exercise partial mapping and missing-object UI branches cleanly.
+        # Exercise partial mapping, unknown Shape Key row.alert, missing audio row.alert, and missing-object UI branches.
         props.shape_i = ""
         rig_cls = getattr(bpy.types, "KUCHISYNC_PT_rig_shapekeys")
+        audio_cls = getattr(bpy.types, "KUCHISYNC_PT_audio_timing")
         exec_cls = getattr(bpy.types, "KUCHISYNC_PT_execution")
         rig_inst = type("_FakePanel", (), {"layout": _LayoutSpy()})()
         exec_inst = type("_FakePanel", (), {"layout": _LayoutSpy()})()
         rig_cls.draw(rig_inst, bpy.context)
         exec_cls.draw(exec_inst, bpy.context)
+
+        props.shape_i = "nonexistent_morph"
+        props.audio_filepath = "/nonexistent/kuchisync_missing.wav"
+        rig_inst_err = type("_FakePanel", (), {"layout": _LayoutSpy()})()
+        audio_inst_err = type("_FakePanel", (), {"layout": _LayoutSpy()})()
+        rig_cls.draw(rig_inst_err, bpy.context)
+        audio_cls.draw(audio_inst_err, bpy.context)
+        _assert(
+            any(
+                kind == "label" and payload.get("text") == "I" and payload.get("alert")
+                for kind, payload in rig_inst_err.layout.calls
+            ),
+            "Expected Panel 1 row.alert for shape_i='nonexistent_morph'",
+        )
+        _assert(
+            any(
+                kind == "label"
+                and "not found" in payload.get("text", "").lower()
+                and payload.get("alert")
+                for kind, payload in audio_inst_err.layout.calls
+            ),
+            "Expected Panel 2 row.alert for missing audio_filepath",
+        )
 
         bpy.context.view_layer.objects.active = None
         rig_inst_none = type("_FakePanel", (), {"layout": _LayoutSpy()})()
@@ -325,6 +360,7 @@ def _verify_icons_and_panels(kuchisync_mod) -> None:
         exec_cls.draw(exec_inst_none, bpy.context)
     finally:
         bpy.context.view_layer.objects.active = saved_active
+        props.audio_filepath = saved_audio
         props.shape_i = saved_shape_i
         props.detection_mode = saved_mode
     print("[ui] verified icons and drew all 5 panels cleanly across UI states")
@@ -478,15 +514,23 @@ def _run_smoke_checks() -> None:
 
             # Verify "saya makan" generates multiple articulated peaks and valley dips (not 1 flat hold).
             vals = [float(kp.co[1]) for kp in aa_in_clip]
+            dedup_vals: list[float] = []
+            for v in vals:
+                if not dedup_vals or abs(v - dedup_vals[-1]) > 1e-6:
+                    dedup_vals.append(v)
             peak_count = sum(
                 1
-                for i in range(1, len(vals) - 1)
-                if vals[i] > 0.5 and vals[i] >= vals[i - 1] and vals[i] >= vals[i + 1]
+                for i in range(1, len(dedup_vals) - 1)
+                if dedup_vals[i] > 0.5
+                and dedup_vals[i] > dedup_vals[i - 1]
+                and dedup_vals[i] > dedup_vals[i + 1]
             )
             dip_count = sum(
                 1
-                for i in range(1, len(vals) - 1)
-                if 0.0 < vals[i] < 0.5 and vals[i] <= vals[i - 1] and vals[i] <= vals[i + 1]
+                for i in range(1, len(dedup_vals) - 1)
+                if 0.0 < dedup_vals[i] < 0.5
+                and dedup_vals[i] < dedup_vals[i - 1]
+                and dedup_vals[i] < dedup_vals[i + 1]
             )
             _assert(peak_count >= 4, f"Expected >= 4 articulated peaks for 'saya makan, halo!', got {peak_count} ({vals})")
             _assert(dip_count >= 2, f"Expected >= 2 valley dips for 'saya makan', got {dip_count} ({vals})")

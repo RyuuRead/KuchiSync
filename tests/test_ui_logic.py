@@ -15,11 +15,11 @@ import zipfile
 
 import numpy as np
 
-from kuchisync import ui_panel
-
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from kuchisync import ui_panel
 
 
 def _write_vowel_wav(
@@ -237,12 +237,12 @@ def _build_mock_bpy(icon_names: set[str] | None = None):
         _resources_root=resources_root,
     )
 
-    active_timers: dict[object, float] = {}
+    active_timers: dict[object, tuple[float, bool]] = {}
 
     class FakeTimers:
         @staticmethod
-        def register(fn, first_interval: float = 0.0):
-            active_timers[fn] = first_interval
+        def register(fn, first_interval: float = 0.0, persistent: bool = False):
+            active_timers[fn] = (first_interval, bool(persistent))
 
         @staticmethod
         def is_registered(fn) -> bool:
@@ -354,6 +354,14 @@ class TestUiLogicAndHygiene(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("transcript", msg.lower())
 
+            for non_vowel_text in ("...", "123"):
+                ok, msg = ui_panel.validate_generation_context(
+                    mesh_obj,
+                    make_props(detection_mode="TRANSCRIPT", transcript_text=non_vowel_text),
+                )
+                self.assertFalse(ok, f"Expected False for {non_vowel_text!r}")
+                self.assertEqual(msg, "Transcript contains no extractable vowels.")
+
             ok, _ = ui_panel.validate_generation_context(
                 mesh_obj, make_props(detection_mode="TRANSCRIPT", transcript_text="saya makan")
             )
@@ -376,7 +384,7 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                 ok, _ = ui_panel.validate_generation_context(mesh_obj, make_props(audio_filepath="//line.wav"))
                 self.assertTrue(ok)
 
-    def test_get_effective_transcript_and_resolve_audio_path(self):
+    def test_get_effective_transcript_and_resolve_blender_path(self):
         self.assertEqual(
             ui_panel.get_effective_transcript(
                 types.SimpleNamespace(transcript_text="   ", transcript_datablock=None)
@@ -403,7 +411,7 @@ class TestUiLogicAndHygiene(unittest.TestCase):
             ),
             "fallback",
         )
-        self.assertEqual(ui_panel.resolve_audio_path("  "), "")
+        self.assertEqual(ui_panel.resolve_blender_path("  "), "")
 
     def test_safe_icon_fallback_behavior(self):
         with mock.patch.object(ui_panel, "bpy", None):
@@ -552,6 +560,7 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                 self.assertEqual(ann["silence_threshold_db"][1]["min"], -60.0)
                 self.assertEqual(ann["silence_threshold_db"][1]["max"], -10.0)
                 self.assertEqual(ann["silence_threshold_db"][1]["default"], -38.0)
+                self.assertNotIn("subtype", ann["audio_filepath"][1])
 
                 # Build realistic fake scene, mesh, slotted action, and VSE container.
                 class FakeKP:
@@ -602,15 +611,12 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                         for n in ("Basis", "Blink", "Angry", "vrc.v_aa", "い", "mouth_u", "viseme_eh", "お")
                     }
                 )
-                bag = types.SimpleNamespace(fcurves=list(fcurves_map.values()))
-                strip = types.SimpleNamespace(channelbag=lambda _slot: FakeBagView())
-
                 class FakeBagView:
                     @property
                     def fcurves(self):
                         return list(fcurves_map.values())
 
-                del bag
+                strip = types.SimpleNamespace(channelbag=lambda _slot: FakeBagView())
                 action = types.SimpleNamespace(
                     slots=["slot0"],
                     layers=[types.SimpleNamespace(strips=[strip])],
@@ -678,6 +684,20 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                     for c in registered
                     if hasattr(c, "execute")
                 }
+
+                # Operator poll() checks for audio/frame/transcript operators
+                no_scene_ctx = types.SimpleNamespace(scene=None)
+                plain_scene_ctx = types.SimpleNamespace(scene=types.SimpleNamespace())
+                for op_id in (
+                    "kuchisync.browse_audio",
+                    "kuchisync.set_start_frame",
+                    "kuchisync.load_transcript",
+                    "kuchisync.generate_lipsync",
+                ):
+                    op_cls = op_by_id[op_id]
+                    self.assertTrue(op_cls.poll(ctx), f"{op_id}.poll(ctx) should be True")
+                    self.assertFalse(op_cls.poll(no_scene_ctx), f"{op_id}.poll(no_scene) should be False")
+                    self.assertFalse(op_cls.poll(plain_scene_ctx), f"{op_id}.poll(plain_scene) should be False")
 
                 # Auto-detect operator
                 auto_op = op_by_id["lipsync.auto_detect_shapekeys"]()
@@ -889,6 +909,8 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                     self.assertEqual(popen_args[:5], [sys.executable, "-m", "pip", "install", "scipy"])
                     self.assertEqual(popen_args[5], "--target")
                     self.assertEqual(len(bpy_mod.app.timers.active()), 1)
+                    timer_reg = bpy_mod.app.timers.active()[next(iter(bpy_mod.app.timers.active()))]
+                    self.assertEqual(timer_reg, (0.5, True))
 
                     # Panel 5 shows running state while process is alive
                     log_running = []
@@ -906,11 +928,18 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                     addsitedir_mock.assert_called_once()
                     refresh_mock.assert_called_once()
 
-                    # Test non-zero exit code + _read_install_log_tail() error display
+                    # Test non-zero exit code + _read_install_log_tail() ignoring pip [notice] lines and preserving tail
                     def popen_failing(*args, **kwargs):
                         del args
                         out_fh = kwargs["stdout"]
-                        out_fh.write(b"Collecting scipy\nERROR: No matching distribution found\n")
+                        out_fh.write(
+                            b"Collecting scipy\n"
+                            b"ERROR: Could not install packages due to an OSError: "
+                            b"[Errno 13] Permission denied: '/opt/blender/modules/scipy'\n"
+                            b"\n"
+                            b"[notice] A new release of pip is available: 23.2.1 -> 24.3.1\n"
+                            b"[notice] To update, run: python -m pip install --upgrade pip\n"
+                        )
                         out_fh.flush()
                         fail_proc = mock.MagicMock()
                         fail_proc.poll.return_value = 1
@@ -930,7 +959,8 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                             and e["icon"] == "ERROR"
                             and e["alert"]
                             and "exit 1" in e["text"]
-                            and "No matching distribution found" in e["text"]
+                            and "Permission denied" in e["text"]
+                            and "[notice]" not in e["text"]
                             for e in log_err
                         )
                     )

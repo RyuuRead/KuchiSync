@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import pathlib
+import sys
 import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from kuchisync import keyframe_gen
 from kuchisync.audio_dsp import FormantFrame
@@ -77,6 +83,37 @@ class TestKeyframeGen(unittest.TestCase):
         self.assertEqual(detected_kana["A"], "口あ")
         self.assertEqual(detected_kana["I"], "リップい")
         self.assertNotIn("O", detected_kana)
+
+    def test_small_kana_skipped_in_substring_tier_but_kept_at_exact_and_token_tiers(self):
+        # Partial rigs without い/え must not match small kana inside ウィンク or フェイス.
+        no_i_rig = ["Basis", "あ", "う", "お", "ウィンク"]
+        det_no_i = keyframe_gen.detect_shapekeys(no_i_rig)
+        self.assertNotIn("I", det_no_i)
+        self.assertNotIn("ウィンク", det_no_i.values())
+
+        no_e_rig = ["Basis", "あ", "い", "う", "お", "ウィンク", "フェイス"]
+        det_no_e = keyframe_gen.detect_shapekeys(no_e_rig)
+        self.assertNotIn("E", det_no_e)
+        self.assertNotIn("ウィンク", det_no_e.values())
+        self.assertNotIn("フェイス", det_no_e.values())
+
+        no_ie_rig = ["Basis", "あ", "う", "お", "ウィンク", "フェア"]
+        det_no_ie = keyframe_gen.detect_shapekeys(no_ie_rig)
+        self.assertEqual(det_no_ie, {"A": "あ", "U": "う", "O": "お"})
+
+        # Exact small-kana names remain at tier 100.
+        exact_small = ["Basis", "ぁ", "ィ", "ぅ", "ェ", "ぉ"]
+        self.assertEqual(
+            keyframe_gen.detect_shapekeys(exact_small),
+            {"A": "ぁ", "I": "ィ", "U": "ぅ", "E": "ェ", "O": "ぉ"},
+        )
+
+        # Separator-delimited small-kana tokens remain at tier 70.
+        token_small = ["Basis", "lip_ぁ", "mouth_ィ", "mth_ゥ_01", "v_ぇ", "face_ぉ"]
+        self.assertEqual(
+            keyframe_gen.detect_shapekeys(token_small),
+            {"A": "lip_ぁ", "I": "mouth_ィ", "U": "mth_ゥ_01", "E": "v_ぇ", "O": "face_ぉ"},
+        )
 
     def test_partial_mapping_fallback(self):
         self.assertEqual(keyframe_gen.resolve_vowel_fallback("E", ["A", "I", "U", "O"]), "I")
@@ -183,6 +220,51 @@ class TestKeyframeGen(unittest.TestCase):
         )
         vals = [k.value for k in scheduled["mouth_a"]]
         self.assertTrue(any(0.1 < v < 0.6 for v in vals))
+
+    def test_mode_b_pause_same_vowel_closes_to_zero_while_remapped_distinct_bridges(self):
+        # "a, a" across a brief pause (gap <= transition_frames, valley_dip_before=False) closes to 0.0.
+        pause_same = [
+            AlignedSyllable("A", 2.0, 6.0, -16.0, False),
+            AlignedSyllable("A", 7.0, 11.0, -16.0, False),
+        ]
+        sched_pause = keyframe_gen.schedule_keyframes(
+            pause_same,
+            {"A": "mouth_a"},
+            {"A": 1.0},
+            start_frame=1,
+            max_mouth_open=1.0,
+            min_phoneme_frames=3,
+            transition_frames=2,
+            co_articulation=0.25,
+            preserve_syllables=True,
+        )
+        events = sched_pause["mouth_a"]
+        peak_idxs = [idx for idx, ev in enumerate(events) if ev.value > 0.5]
+        self.assertEqual(len(peak_idxs), 2)
+        between_vals = [events[i].value for i in range(peak_idxs[0] + 1, peak_idxs[1])]
+        self.assertIn(0.0, between_vals)
+
+        # Distinct remapped vowels ("e" + "a" onto mouth_a) still bridge cleanly without 0.0.
+        remapped_distinct = [
+            AlignedSyllable("E", 2.0, 6.0, -16.0, False),
+            AlignedSyllable("A", 7.0, 11.0, -16.0, False),
+        ]
+        sched_bridge = keyframe_gen.schedule_keyframes(
+            remapped_distinct,
+            {"A": "mouth_a"},
+            {"A": 1.0},
+            start_frame=1,
+            max_mouth_open=1.0,
+            min_phoneme_frames=3,
+            transition_frames=2,
+            co_articulation=0.25,
+            preserve_syllables=True,
+        )
+        bridge_events = sched_bridge["mouth_a"]
+        bridge_peaks = [idx for idx, ev in enumerate(bridge_events) if ev.value > 0.5]
+        self.assertEqual(len(bridge_peaks), 2)
+        bridge_between = [bridge_events[i].value for i in range(bridge_peaks[0] + 1, bridge_peaks[1])]
+        self.assertEqual(bridge_between, [])
 
     def test_slotted_action_writer_scoped_clear_and_vse_sync_mode(self):
         existing_kp = _FakeKP(5, 0.8)
@@ -487,6 +569,69 @@ class TestKeyframeGen(unittest.TestCase):
         keyframe_gen.add_audio_to_vse(scene, "/tmp/second.wav", 15)
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0].channel, 2)
+
+    def test_vse_left_trimmed_strips_use_visual_start_for_channel_selection(self):
+        # Blender 5.2+ left_handle > content_start frees earlier frames on channel 1.
+        created_52 = []
+
+        class Trimmed52:
+            def __init__(self, filepath, channel, content_start, left_handle, right_handle):
+                self.type = "SOUND"
+                self.sound = type("SND", (), {"filepath": filepath})()
+                self.channel = channel
+                self.content_start = float(content_start)
+                self.left_handle = float(left_handle)
+                self.right_handle = float(right_handle)
+
+        class Strips52(list):
+            def new_sound(self, name, filepath, channel, frame_start):
+                del name
+                s = Trimmed52(filepath, channel, frame_start, frame_start, frame_start + 20)
+                created_52.append(s)
+                self.append(s)
+                return s
+
+        trimmed_52 = Trimmed52("/tmp/orig.wav", channel=1, content_start=10, left_handle=30, right_handle=50)
+        scene_52 = type(
+            "Scene52Trim",
+            (),
+            {"sync_mode": "NONE", "sequence_editor": type("SE", (), {"strips": Strips52([trimmed_52])})()},
+        )()
+        keyframe_gen.add_audio_to_vse(scene_52, "/tmp/early.wav", 15)
+        self.assertEqual(created_52[-1].channel, 1)
+        keyframe_gen.add_audio_to_vse(scene_52, "/tmp/overlap.wav", 35)
+        self.assertEqual(created_52[-1].channel, 2)
+
+        # Blender 4.4-5.1 frame_final_start > frame_start also frees earlier frames on channel 1.
+        created_45 = []
+
+        class Trimmed45:
+            def __init__(self, filepath, channel, frame_start, final_start, final_end):
+                self.type = "SOUND"
+                self.sound = type("SND", (), {"filepath": filepath})()
+                self.channel = channel
+                self.frame_start = float(frame_start)
+                self.frame_final_start = float(final_start)
+                self.frame_final_end = float(final_end)
+
+        class Strips45(list):
+            def new_sound(self, name, filepath, channel, frame_start):
+                del name
+                s = Trimmed45(filepath, channel, frame_start, frame_start, frame_start + 20)
+                created_45.append(s)
+                self.append(s)
+                return s
+
+        trimmed_45 = Trimmed45("/tmp/orig.wav", channel=1, frame_start=10, final_start=30, final_end=50)
+        scene_45 = type(
+            "Scene45Trim",
+            (),
+            {"sync_mode": "NONE", "sequence_editor": type("SE", (), {"sequences": Strips45([trimmed_45])})()},
+        )()
+        keyframe_gen.add_audio_to_vse(scene_45, "/tmp/early45.wav", 15)
+        self.assertEqual(created_45[-1].channel, 1)
+        keyframe_gen.add_audio_to_vse(scene_45, "/tmp/overlap45.wav", 35)
+        self.assertEqual(created_45[-1].channel, 2)
 
 
 if __name__ == "__main__":

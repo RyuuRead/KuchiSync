@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import pathlib
+import sys
 import tomllib
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 class TestManifestAndInit(unittest.TestCase):
@@ -41,7 +44,7 @@ class TestManifestAndInit(unittest.TestCase):
             src = py_path.read_text(encoding="utf-8")
             self.assertNotRegex(
                 src,
-                r"(?m)^(?:from|import)\s+kuchisync\b",
+                r"(?m)^\s*(?:from|import)\s+kuchisync\b",
                 f"Extension modules must use relative imports: {py_path.name}",
             )
 
