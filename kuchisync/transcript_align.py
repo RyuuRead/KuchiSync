@@ -6,7 +6,7 @@ import re
 
 import numpy as np
 
-from kuchisync import audio_dsp
+from . import audio_dsp
 
 PHRASE_SPLIT_RE = re.compile(r"[.,?!;:\r\n]+")
 WORD_SPLIT_RE = re.compile(r"[A-Za-z\u00C0-\u024F']+")
