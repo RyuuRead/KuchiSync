@@ -484,7 +484,7 @@ def _extract_formants(xw: np.ndarray, sr: int, order: int = LPC_ORDER) -> tuple[
     scale = float(sr) / (2.0 * math.pi)
     freqs = np.arctan2(np.imag(roots), np.real(roots)) * scale
     mags = np.maximum(np.abs(roots), 1e-12)
-    bws = -scale * np.log(mags)
+    bws = -(float(sr) / math.pi) * np.log(mags)
 
     valid = sorted(
         float(freq)
