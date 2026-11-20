@@ -806,13 +806,31 @@ def _resolve_vse_container(sequence_editor):
     return None
 
 
+def _strip_start(strip, default: float = 0.0) -> float:
+    """Read strip start frame across Blender 5.2+ (content_start) and 4.4-5.1 (frame_start)."""
+    for attr in ("content_start", "frame_start"):
+        val = getattr(strip, attr, None)
+        if val is not None:
+            return float(val)
+    return default
+
+
+def _strip_end(strip) -> float | None:
+    """Read strip end frame across Blender 5.2+ (right_handle) and 4.4-5.1 (frame_final_end)."""
+    for attr in ("right_handle", "frame_final_end"):
+        val = getattr(strip, attr, None)
+        if val is not None:
+            return float(val)
+    return None
+
+
 def _find_open_vse_channel(strips: Sequence, frame_start: int) -> int:
     """Choose the lowest VSE channel >= 1 free at frame_start."""
     occupied: set[int] = set()
     for strip in strips:
         ch = int(getattr(strip, "channel", 1))
-        s_start = float(getattr(strip, "frame_start", 0))
-        s_end = getattr(strip, "frame_final_end", None)
+        s_start = _strip_start(strip, 0.0)
+        s_end = _strip_end(strip)
         if s_end is None:
             if int(round(s_start)) == int(frame_start):
                 occupied.add(ch)
@@ -856,7 +874,7 @@ def add_audio_to_vse(scene, filepath: str, frame_start: int) -> None:
             continue
         if (
             _normalize_audio_path(strip_path) == target_norm
-            and int(round(float(getattr(strip, "frame_start", -1)))) == int(frame_start)
+            and int(round(_strip_start(strip, -1.0))) == int(frame_start)
         ):
             if hasattr(scene, "sync_mode"):
                 scene.sync_mode = "AUDIO_SYNC"

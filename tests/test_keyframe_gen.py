@@ -448,6 +448,46 @@ class TestKeyframeGen(unittest.TestCase):
         self.assertEqual([kp.co[0] for kp in fc_a.keyframe_points], [5.0, 50.0])
         self.assertTrue(fc_a.updated)
 
+    def test_vse_5_2_content_start_and_right_handle_without_frame_start(self):
+        created = []
+
+        class StripV52:
+            def __init__(self, filepath, channel, start, end):
+                self.type = "SOUND"
+                self.sound = type("SND", (), {"filepath": filepath})()
+                self.channel = channel
+                self.content_start = float(start)
+                self.right_handle = float(end)
+
+        class StripsV52(list):
+            def new_sound(self, name, filepath, channel, frame_start):
+                del name
+                s = StripV52(filepath, channel, frame_start, frame_start + 30)
+                created.append(s)
+                self.append(s)
+                return s
+
+        existing = StripV52("/tmp/first.wav", channel=1, start=10, end=50)
+        strips = StripsV52([existing])
+        scene = type(
+            "Scene52",
+            (),
+            {
+                "sync_mode": "NONE",
+                "sequence_editor": type("SE", (), {"strips": strips})(),
+            },
+        )()
+
+        # Re-adding /tmp/first.wav at frame 10 hits content_start dedupe without creating a strip.
+        keyframe_gen.add_audio_to_vse(scene, "/tmp/first.wav", 10)
+        self.assertEqual(len(created), 0)
+        self.assertEqual(scene.sync_mode, "AUDIO_SYNC")
+
+        # Adding a different file overlapping frame 10 picks open channel 2 via content_start/right_handle.
+        keyframe_gen.add_audio_to_vse(scene, "/tmp/second.wav", 15)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].channel, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

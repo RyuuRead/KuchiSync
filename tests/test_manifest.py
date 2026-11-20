@@ -35,6 +35,16 @@ class TestManifestAndInit(unittest.TestCase):
         kuchisync.register()
         kuchisync.unregister()
 
+    def test_no_absolute_addon_imports(self):
+        addon_dir = ROOT / "kuchisync"
+        for py_path in sorted(addon_dir.glob("*.py")):
+            src = py_path.read_text(encoding="utf-8")
+            self.assertNotRegex(
+                src,
+                r"(?m)^(?:from|import)\s+kuchisync\b",
+                f"Extension modules must use relative imports: {py_path.name}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
