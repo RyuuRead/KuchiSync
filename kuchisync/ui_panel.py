@@ -58,17 +58,43 @@ def _icon_exists(enum_items, icon_name: str) -> bool:
         return False
 
 
+def _get_icon_enum_items(bpy_mod):
+    """Locate Blender UILayout icon enum_items via bl_rna.functions['prop'|'label']."""
+    ui_layout = getattr(getattr(bpy_mod, "types", None), "UILayout", None)
+    bl_rna = getattr(ui_layout, "bl_rna", None)
+    functions = getattr(bl_rna, "functions", None)
+    if functions is None:
+        return None
+
+    for fn_name in ("prop", "label"):
+        try:
+            if fn_name not in functions:
+                continue
+            fn = functions[fn_name]
+        except Exception:
+            continue
+        params = getattr(fn, "parameters", None)
+        if params is None:
+            continue
+        try:
+            if "icon" not in params:
+                continue
+            icon_param = params["icon"]
+        except Exception:
+            continue
+        enum_items = getattr(icon_param, "enum_items", None)
+        if enum_items is not None:
+            return enum_items
+    return None
+
+
 def safe_icon(icon_name: str, fallback: str = "NONE") -> str:
     """Resolve a Blender UI icon against UILayout RNA enum items with safe fallback."""
     bpy_mod = _get_bpy()
     if bpy_mod is None:
         return fallback
     try:
-        ui_layout = getattr(getattr(bpy_mod, "types", None), "UILayout", None)
-        bl_rna = getattr(ui_layout, "bl_rna", None)
-        rna_props = getattr(bl_rna, "properties", None)
-        icon_prop = rna_props["icon"] if rna_props is not None and "icon" in rna_props else None
-        enum_items = getattr(icon_prop, "enum_items", None)
+        enum_items = _get_icon_enum_items(bpy_mod)
         if enum_items is None:
             return fallback
         if _icon_exists(enum_items, icon_name):
@@ -912,6 +938,7 @@ if bpy is not None:
                 return self._fail(f"Target modules directory is read-only: {target_dir}")
 
             _close_install_log()
+            log_file = None
             try:
                 log_file = tempfile.TemporaryFile(mode="w+b")
                 proc = subprocess.Popen(
@@ -921,6 +948,11 @@ if bpy is not None:
                     stdin=subprocess.DEVNULL,
                 )
             except OSError as exc:
+                if log_file is not None:
+                    try:
+                        log_file.close()
+                    except Exception:
+                        pass
                 _close_install_log()
                 return self._fail(f"Failed to start pip subprocess: {exc}")
 
@@ -931,7 +963,12 @@ if bpy is not None:
             _scipy_install_state["status_message"] = "Installing SciPy..."
             _scipy_install_state["error_message"] = ""
 
-            bpy_mod.app.timers.register(_poll_scipy_install, first_interval=0.5)
+            try:
+                bpy_mod.app.timers.register(_poll_scipy_install, first_interval=0.5)
+            except Exception as exc:
+                _cleanup_scipy_installer()
+                return self._fail(f"Failed to register SciPy install timer: {exc}")
+
             _redraw_view3d()
             self.report({"INFO"}, "Installing SciPy in background...")
             return {"FINISHED"}

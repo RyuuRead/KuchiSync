@@ -11,12 +11,15 @@ import types
 import unittest
 from unittest import mock
 import wave
+import zipfile
 
 import numpy as np
 
 from kuchisync import ui_panel
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def _write_vowel_wav(
@@ -43,14 +46,25 @@ def _write_vowel_wav(
 class _FakeRecordingLayout:
     """Minimal UILayout recorder verifying panel draw paths and widget states."""
 
-    def __init__(self, log: list[dict] | None = None):
+    def __init__(self, log: list[dict] | None = None, parent: "_FakeRecordingLayout | None" = None):
         self.enabled = True
         self.alert = False
         self.scale_y = 1.0
+        self._parent = parent
         self._log = log if log is not None else []
 
+    def _effective_enabled(self) -> bool:
+        if self._parent is not None:
+            return self.enabled and self._parent._effective_enabled()
+        return self.enabled
+
+    def _effective_alert(self) -> bool:
+        if self._parent is not None:
+            return self.alert or self._parent._effective_alert()
+        return self.alert
+
     def _child(self) -> "_FakeRecordingLayout":
-        return _FakeRecordingLayout(self._log)
+        return _FakeRecordingLayout(self._log, parent=self)
 
     def row(self, align: bool = False) -> "_FakeRecordingLayout":
         del align
@@ -68,15 +82,37 @@ class _FakeRecordingLayout:
         return self._child()
 
     def label(self, text: str = "", icon: str = "NONE") -> None:
-        self._log.append({"kind": "label", "text": text, "icon": icon, "alert": self.alert})
+        self._log.append(
+            {
+                "kind": "label",
+                "text": text,
+                "icon": icon,
+                "alert": self._effective_alert(),
+                "enabled": self._effective_enabled(),
+            }
+        )
 
     def prop(self, data, prop_name: str, text=None, slider: bool = False, expand: bool = False) -> None:
         del data, text, slider, expand
-        self._log.append({"kind": "prop", "prop": prop_name, "enabled": self.enabled})
+        self._log.append(
+            {
+                "kind": "prop",
+                "prop": prop_name,
+                "enabled": self._effective_enabled(),
+                "alert": self._effective_alert(),
+            }
+        )
 
     def prop_search(self, data, prop_name: str, search_data, search_prop: str, text: str = "") -> None:
         del data, search_data, search_prop, text
-        self._log.append({"kind": "prop_search", "prop": prop_name})
+        self._log.append(
+            {
+                "kind": "prop_search",
+                "prop": prop_name,
+                "enabled": self._effective_enabled(),
+                "alert": self._effective_alert(),
+            }
+        )
 
     def operator(self, operator_id: str, text: str | None = None, icon: str = "NONE") -> dict:
         entry = {
@@ -84,7 +120,8 @@ class _FakeRecordingLayout:
             "operator": operator_id,
             "text": text,
             "icon": icon,
-            "enabled": self.enabled,
+            "enabled": self._effective_enabled(),
+            "alert": self._effective_alert(),
             "scale_y": self.scale_y,
         }
         self._log.append(entry)
@@ -152,7 +189,15 @@ def _build_mock_bpy(icon_names: set[str] | None = None):
 
     class FakeUILayout:
         bl_rna = types.SimpleNamespace(
-            properties={"icon": types.SimpleNamespace(enum_items=enum_items)}
+            properties={},
+            functions={
+                "prop": types.SimpleNamespace(
+                    parameters={"icon": types.SimpleNamespace(enum_items=enum_items)}
+                ),
+                "label": types.SimpleNamespace(
+                    parameters={"icon": types.SimpleNamespace(enum_items=enum_items)}
+                ),
+            },
         )
 
     bpy_mod.types = types.SimpleNamespace(
@@ -232,6 +277,12 @@ def _build_mock_bpy(icon_names: set[str] | None = None):
 
     class FakeImportHelper:
         filepath: str = ""
+        invoke_calls: list[str] = []
+
+        def invoke(self, context, event):
+            del context, event
+            self.invoke_calls.append(self.filepath)
+            return {"RUNNING_MODAL"}
 
     io_utils_mod.ImportHelper = FakeImportHelper
     bpy_extras_mod.io_utils = io_utils_mod
@@ -360,24 +411,58 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                 self.assertEqual(ui_panel.safe_icon("CHECKMARK"), "NONE")
                 self.assertEqual(ui_panel.safe_icon("CHECKMARK", fallback="INFO"), "INFO")
 
-        fake_bpy = types.SimpleNamespace(
+        icon_items = {"CHECKMARK": object(), "INFO": object(), "NONE": object()}
+        fake_bpy_prop_fn = types.SimpleNamespace(
             types=types.SimpleNamespace(
                 UILayout=types.SimpleNamespace(
                     bl_rna=types.SimpleNamespace(
-                        properties={
-                            "icon": types.SimpleNamespace(
-                                enum_items={"CHECKMARK": object(), "INFO": object(), "NONE": object()}
+                        properties={},
+                        functions={
+                            "prop": types.SimpleNamespace(
+                                parameters={"icon": types.SimpleNamespace(enum_items=icon_items)}
                             )
-                        }
+                        },
                     )
                 )
             )
         )
-        with mock.patch.object(ui_panel, "bpy", fake_bpy):
+        with mock.patch.object(ui_panel, "bpy", fake_bpy_prop_fn):
             self.assertEqual(ui_panel.safe_icon("CHECKMARK"), "CHECKMARK")
             self.assertEqual(ui_panel.safe_icon("MISSING_ICON"), "NONE")
             self.assertEqual(ui_panel.safe_icon("MISSING_ICON", fallback="INFO"), "INFO")
             self.assertEqual(ui_panel.safe_icon("MISSING_ICON", fallback="NOPE"), "NONE")
+
+        # Fallback to bl_rna.functions["label"].parameters["icon"].enum_items when "prop" lacks it.
+        fake_bpy_label_fn = types.SimpleNamespace(
+            types=types.SimpleNamespace(
+                UILayout=types.SimpleNamespace(
+                    bl_rna=types.SimpleNamespace(
+                        properties={},
+                        functions={
+                            "label": types.SimpleNamespace(
+                                parameters={"icon": types.SimpleNamespace(enum_items=icon_items)}
+                            )
+                        },
+                    )
+                )
+            )
+        )
+        with mock.patch.object(ui_panel, "bpy", fake_bpy_label_fn):
+            self.assertEqual(ui_panel.safe_icon("CHECKMARK"), "CHECKMARK")
+
+        # Real Blender UILayout.bl_rna.properties does not carry "icon"; mock with only properties fails safely.
+        fake_bpy_props_only = types.SimpleNamespace(
+            types=types.SimpleNamespace(
+                UILayout=types.SimpleNamespace(
+                    bl_rna=types.SimpleNamespace(
+                        properties={"icon": types.SimpleNamespace(enum_items=icon_items)},
+                        functions={},
+                    )
+                )
+            )
+        )
+        with mock.patch.object(ui_panel, "bpy", fake_bpy_props_only):
+            self.assertEqual(ui_panel.safe_icon("CHECKMARK"), "NONE")
 
     def test_antislop_code_and_copy_hygiene(self):
         banned_buzz = (
@@ -393,7 +478,7 @@ class TestUiLogicAndHygiene(unittest.TestCase):
         )
         emoji_re = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
         banner_re = re.compile(r"#\s*[=\-]{4,}")
-        for py in sorted((ROOT / "kuchisync").glob("*.py")):
+        for py in sorted(list((ROOT / "kuchisync").glob("*.py")) + list((ROOT / "scripts").glob("*.py"))):
             src = py.read_text(encoding="utf-8")
             self.assertTrue(src.startswith("# SPDX-License-Identifier: GPL-3.0-or-later"), str(py))
             self.assertNotIn("\u2014", src, f"Em dash found in {py}")
@@ -625,6 +710,21 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                     self.assertEqual(props.transcript_text, "saya makan")
 
                     props.audio_filepath = str(wav_path)
+
+                    # Browse audio operator (invoke + execute)
+                    browse_op = op_by_id["kuchisync.browse_audio"]()
+                    browse_op.reports = []
+                    browse_op.filepath = ""
+                    bpy_extras_mod.io_utils.ImportHelper.invoke_calls.clear()
+                    self.assertEqual(browse_op.invoke(ctx, None), {"RUNNING_MODAL"})
+                    self.assertEqual(browse_op.filepath, str(wav_path))
+                    self.assertEqual(bpy_extras_mod.io_utils.ImportHelper.invoke_calls, [str(wav_path)])
+                    picked_wav = pathlib.Path(tmp) / "picked.wav"
+                    browse_op.filepath = str(picked_wav)
+                    self.assertEqual(browse_op.execute(ctx), {"FINISHED"})
+                    self.assertEqual(props.audio_filepath, str(picked_wav))
+                    props.audio_filepath = str(wav_path)
+
                     gen_op = op_by_id["kuchisync.generate_lipsync"]()
                     gen_op.reports = []
                     self.assertEqual(gen_op.execute(ctx), {"FINISHED"})
@@ -679,6 +779,40 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                     self.assertTrue(
                         any(e.get("prop") == f"strength_{v}" for e in log_p1_full)
                     )
+
+                # Panel 1: partial mapping (1..4 vowels) info box + missing Shape Key row.alert state
+                saved_shapes = (props.shape_i, props.shape_u, props.shape_e, props.shape_o)
+                try:
+                    props.shape_i = "nonexistent_key"
+                    props.shape_u = ""
+                    props.shape_e = ""
+                    props.shape_o = ""
+                    log_p1_partial = []
+                    panel_by_name["KUCHISYNC_PT_rig_shapekeys"].draw(
+                        types.SimpleNamespace(layout=_FakeRecordingLayout(log_p1_partial)), ctx
+                    )
+                    self.assertTrue(
+                        any(
+                            e["kind"] == "label"
+                            and "Mapped 1 of 5 vowels" in e["text"]
+                            and e["icon"] == "INFO"
+                            and not e["alert"]
+                            for e in log_p1_partial
+                        )
+                    )
+                    vowel_labels = {
+                        e["text"]: e
+                        for e in log_p1_partial
+                        if e["kind"] == "label" and e["text"] in ("A", "I", "U", "E", "O")
+                    }
+                    self.assertEqual(vowel_labels["A"]["icon"], "CHECKMARK")
+                    self.assertFalse(vowel_labels["A"]["alert"])
+                    self.assertEqual(vowel_labels["I"]["icon"], "ERROR")
+                    self.assertTrue(vowel_labels["I"]["alert"])
+                    self.assertEqual(vowel_labels["U"]["icon"], "ERROR")
+                    self.assertFalse(vowel_labels["U"]["alert"])
+                finally:
+                    props.shape_i, props.shape_u, props.shape_e, props.shape_o = saved_shapes
 
                 # Panel 2 and Panel 4 draws
                 log_p2 = []
@@ -772,6 +906,63 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                     addsitedir_mock.assert_called_once()
                     refresh_mock.assert_called_once()
 
+                    # Test non-zero exit code + _read_install_log_tail() error display
+                    def popen_failing(*args, **kwargs):
+                        del args
+                        out_fh = kwargs["stdout"]
+                        out_fh.write(b"Collecting scipy\nERROR: No matching distribution found\n")
+                        out_fh.flush()
+                        fail_proc = mock.MagicMock()
+                        fail_proc.poll.return_value = 1
+                        return fail_proc
+
+                    with mock.patch("kuchisync.ui_panel.subprocess.Popen", side_effect=popen_failing):
+                        self.assertEqual(scipy_op.execute(ctx), {"FINISHED"})
+                        timer_cb = next(iter(bpy_mod.app.timers.active()))
+                        self.assertIsNone(timer_cb())
+                    log_err = []
+                    panel_by_name["KUCHISYNC_PT_execution"].draw(
+                        types.SimpleNamespace(layout=_FakeRecordingLayout(log_err)), ctx
+                    )
+                    self.assertTrue(
+                        any(
+                            e["kind"] == "label"
+                            and e["icon"] == "ERROR"
+                            and e["alert"]
+                            and "exit 1" in e["text"]
+                            and "No matching distribution found" in e["text"]
+                            for e in log_err
+                        )
+                    )
+
+                    # Read-only target directory aborts without spawning pip
+                    scipy_op.reports = []
+                    with (
+                        mock.patch("kuchisync.ui_panel.os.access", return_value=False),
+                        mock.patch("kuchisync.ui_panel.subprocess.Popen") as ro_popen,
+                    ):
+                        self.assertEqual(scipy_op.execute(ctx), {"CANCELLED"})
+                        ro_popen.assert_not_called()
+                        self.assertTrue(any("read-only" in msg.lower() for _, msg in scipy_op.reports))
+
+                    # Popen OSError closes temporary log handle cleanly without ResourceWarning leak
+                    created_logs: list = []
+                    orig_temp_file = tempfile.TemporaryFile
+
+                    def spy_temp_file(*args, **kwargs):
+                        fh = orig_temp_file(*args, **kwargs)
+                        created_logs.append(fh)
+                        return fh
+
+                    scipy_op.reports = []
+                    with (
+                        mock.patch("kuchisync.ui_panel.tempfile.TemporaryFile", side_effect=spy_temp_file),
+                        mock.patch("kuchisync.ui_panel.subprocess.Popen", side_effect=OSError("no pip")),
+                    ):
+                        self.assertEqual(scipy_op.execute(ctx), {"CANCELLED"})
+                    self.assertEqual(len(created_logs), 1)
+                    self.assertTrue(created_logs[0].closed)
+
                     # Test unregister() cleanup while process & timer are active
                     fake_proc.poll.return_value = None
                     scipy_op.execute(ctx)
@@ -793,6 +984,32 @@ class TestUiLogicAndHygiene(unittest.TestCase):
 
             importlib.reload(ui_panel)
             importlib.reload(kuchisync)
+
+    def test_package_addon_builds_root_extension_zip(self):
+        from scripts import package_addon
+
+        expected_root_files = {
+            "__init__.py",
+            "audio_dsp.py",
+            "blender_manifest.toml",
+            "keyframe_gen.py",
+            "transcript_align.py",
+            "ui_panel.py",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out_zip = package_addon.build_extension_zip(pathlib.Path(tmp) / "kuchisync.zip")
+            self.assertTrue(out_zip.is_file())
+            with zipfile.ZipFile(out_zip, "r") as zf:
+                names = set(zf.namelist())
+                self.assertEqual(names, expected_root_files)
+                self.assertFalse(any("__pycache__" in n or n.endswith(".pyc") for n in names))
+
+        dist_zip = ROOT / "dist" / "kuchisync.zip"
+        self.assertTrue(dist_zip.is_file(), "dist/kuchisync.zip missing")
+        with zipfile.ZipFile(dist_zip, "r") as zf:
+            names = set(zf.namelist())
+            self.assertEqual(names, expected_root_files)
+            self.assertFalse(any("__pycache__" in n or n.endswith(".pyc") for n in names))
 
 
 if __name__ == "__main__":
