@@ -14,29 +14,40 @@ bl_info = {
     "category": "Animation",
 }
 
-if importlib.util.find_spec("bpy") is not None:
-    if "bpy" in locals():
+def _has_module(module_name: str) -> bool:
+    """Check module availability safely even if bare mocks without __spec__ exist."""
+    if module_name in sys.modules:
+        return sys.modules[module_name] is not None
+    return importlib.util.find_spec(module_name) is not None
+
+
+if _has_module("bpy"):
+    if "bpy" in locals() or any(
+        f"{__name__}.{_sub}" in sys.modules
+        for _sub in ("audio_dsp", "transcript_align", "keyframe_gen", "ui_panel")
+    ):
         for _submodule in ("audio_dsp", "transcript_align", "keyframe_gen", "ui_panel"):
             _module_name = f"{__name__}.{_submodule}"
             if _module_name in sys.modules:
                 importlib.reload(sys.modules[_module_name])
     import bpy
 
-    if importlib.util.find_spec(f"{__name__}.ui_panel") is not None:
-        from . import ui_panel
+    if _has_module(f"{__name__}.ui_panel"):
+        from . import ui_panel as _ui_panel
     else:
-        ui_panel = None
+        _ui_panel = None
 else:
-    ui_panel = None
+    bpy = None
+    _ui_panel = None
 
 
 def register() -> None:
     """Register add-on classes and scene properties when running inside Blender."""
-    if ui_panel is not None:
-        ui_panel.register()
+    if _ui_panel is not None:
+        _ui_panel.register()
 
 
 def unregister() -> None:
     """Unregister add-on classes and clean up scene properties."""
-    if ui_panel is not None:
-        ui_panel.unregister()
+    if _ui_panel is not None:
+        _ui_panel.unregister()
