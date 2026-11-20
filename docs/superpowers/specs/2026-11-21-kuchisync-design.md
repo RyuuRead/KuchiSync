@@ -1,7 +1,7 @@
 # KuchiSync Design Specification
 
 **Date:** 2026-11-21
-**Status:** Ready for Approval
+**Status:** Approved (includes Per-Vowel Strength 0.0-1.5 and scene.sync_mode = 'AUDIO_SYNC')
 **Target Environment:** Goo Engine 4.4.3 (Blender 4.4), Blender 4.5 LTS, Blender 5.2 LTS (5.0+)
 **License:** GPL-3.0-or-later
 
@@ -61,6 +61,7 @@ Blender 5.0 renamed `SequenceEditor.sequences` to `SequenceEditor.strips`.
   1. Call `scene.sequence_editor_create()` if `scene.sequence_editor` is None.
   2. Resolve container via `getattr(se, "strips", None)` else `getattr(se, "sequences", None)`.
   3. Add the sound cleanly via `new_sound(name=..., filepath=..., channel=..., frame_start=...)` on an available audio channel (avoiding duplicate identical strip at the same start frame when regenerating).
+  4. Set `scene.sync_mode = 'AUDIO_SYNC'` (guarded with `hasattr(scene, "sync_mode")` / valid enum check) so 3D Viewport playback remains synchronized with VSE audio.
 
 ## 4. Shape Key Auto-Detection, Partial Mappings & Per-Vowel Strength
 
