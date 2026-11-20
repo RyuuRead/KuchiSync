@@ -8,9 +8,14 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 import wave
 
 import numpy as np
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from kuchisync import audio_dsp
 
@@ -173,6 +178,33 @@ class TestAudioDsp(unittest.TestCase):
                 majority = max(set(preds), key=preds.count)
                 self.assertEqual(majority, expected_vowel)
 
+            # Single-vowel and 2-vowel shifted utterances resist collapsing onto neighboring vowels.
+            for subset in (("A",), ("I",), ("A", "I"), ("U", "E")):
+                sub_chunks = []
+                for v in subset:
+                    f1, f2 = centroids[v]
+                    sub_chunks.append(
+                        (
+                            0.45 * np.sin(2 * np.pi * (f1 * sf1) * t)
+                            + 0.30 * np.sin(2 * np.pi * (f2 * sf2) * t)
+                        ).astype(np.float32)
+                    )
+                sub_audio = np.concatenate(sub_chunks)
+                sub_frames = audio_dsp.analyze_audio_frames(
+                    sub_audio, sr, silence_threshold_db=-38.0, voice_type="FEMALE_STANDARD"
+                )
+                sub_norm = audio_dsp.compute_speaker_normalized_scores(sub_frames)
+                sub_chunk_frames = len(sub_frames) // len(subset)
+                for idx, expected_vowel in enumerate(subset):
+                    sl = sub_norm[idx * sub_chunk_frames + 2 : (idx + 1) * sub_chunk_frames - 2]
+                    preds = [max(sc, key=sc.get) for sc in sl]
+                    majority = max(set(preds), key=preds.count)
+                    self.assertEqual(
+                        majority,
+                        expected_vowel,
+                        f"Mismatch for subset={subset} scale={(sf1, sf2)} at {expected_vowel}",
+                    )
+
     def test_bandpass_vocal_attenuates_out_of_band_frequencies(self):
         sr = 16000
         t = np.arange(int(sr * 0.5), dtype=np.float64) / sr
@@ -182,7 +214,10 @@ class TestAudioDsp(unittest.TestCase):
         filtered_low = audio_dsp.bandpass_vocal(low_tone.astype(np.float32), sr)
         filtered_mid = audio_dsp.bandpass_vocal(mid_tone.astype(np.float32), sr)
         filtered_high = audio_dsp.bandpass_vocal(high_tone.astype(np.float32), sr)
-        rms = lambda x: float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+
+        def rms(x: np.ndarray) -> float:
+            return float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+
         self.assertLess(rms(filtered_low), 0.1 * rms(low_tone))
         self.assertGreater(rms(filtered_mid), 0.85 * rms(mid_tone))
         self.assertLess(rms(filtered_high), 0.1 * rms(high_tone))
@@ -334,6 +369,39 @@ class TestAudioDsp(unittest.TestCase):
         voiced = [f.vowel for f in frames if f.is_voiced and f.vowel]
         self.assertTrue(voiced)
         self.assertEqual(max(set(voiced), key=voiced.count), "A")
+
+        # Verify compute_speaker_normalized_scores selects language-specific centroids.
+        eng_frame = audio_dsp.FormantFrame(
+            time_sec=0.0,
+            f1=780.0,
+            f2=1320.0,
+            rms_db=-16.0,
+            zcr=0.05,
+            is_voiced=True,
+            vowel="A",
+            scores={},
+        )
+        en_scores = audio_dsp.compute_speaker_normalized_scores([eng_frame] * 4, language="ENGLISH")
+        id_scores = audio_dsp.compute_speaker_normalized_scores([eng_frame] * 4, language="INDONESIAN")
+        self.assertGreater(en_scores[0]["A"], id_scores[0]["A"])
+
+        with mock.patch(
+            "kuchisync.audio_dsp._estimate_vocal_tract_scale",
+            wraps=audio_dsp._estimate_vocal_tract_scale,
+        ) as scale_spy:
+            audio_dsp.compute_speaker_normalized_scores([eng_frame] * 6, language="ENGLISH")
+        self.assertEqual(scale_spy.call_args[0][2], audio_dsp.VOWEL_CENTROIDS["ENGLISH"])
+
+    def test_decode_with_ffmpeg_passes_devnull_stdin(self):
+        fake_samples = np.ones(8, dtype="<f4").tobytes()
+        fake_proc = types.SimpleNamespace(returncode=0, stdout=fake_samples, stderr=b"")
+        with (
+            mock.patch("kuchisync.audio_dsp.shutil.which", return_value="/usr/bin/ffmpeg"),
+            mock.patch("kuchisync.audio_dsp.subprocess.run", return_value=fake_proc) as run_mock,
+        ):
+            decoded = audio_dsp._decode_with_ffmpeg(pathlib.Path("/tmp/clip.ogg"), 16000)
+        self.assertEqual(len(decoded), 8)
+        self.assertEqual(run_mock.call_args.kwargs.get("stdin"), subprocess.DEVNULL)
 
     def test_dynamic_scipy_detection_and_dsp_dispatch(self):
         calls = []

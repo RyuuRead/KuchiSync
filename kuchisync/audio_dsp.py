@@ -370,7 +370,7 @@ def _decode_with_ffmpeg(path: pathlib.Path, target_sr: int) -> np.ndarray:
         "f32le",
         "pipe:1",
     ]
-    proc = subprocess.run(cmd, capture_output=True, check=False)
+    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, check=False)
     if proc.returncode != 0:
         err_msg = proc.stderr.decode("utf-8", errors="replace").strip()
         raise AudioLoadError(f"ffmpeg failed ({proc.returncode}): {err_msg or 'unknown error'}")
@@ -675,12 +675,18 @@ def _estimate_vocal_tract_scale(
     return best_scale
 
 
-def compute_speaker_normalized_scores(frames: list[FormantFrame]) -> list[dict[str, float]]:
+def compute_speaker_normalized_scores(
+    frames: list[FormantFrame],
+    language: str = "INDONESIAN",
+) -> list[dict[str, float]]:
     """Compute speaker-normalized Mode B vowel likelihoods without requiring Voice Type."""
     if not frames:
         return []
 
-    centroids = VOWEL_CENTROIDS["INDONESIAN"]
+    lang_key = str(language or "INDONESIAN").strip().upper()
+    if lang_key in ("ENGLISH", "EN", "ENG"):
+        lang_key = "ENGLISH"
+    centroids = VOWEL_CENTROIDS.get(lang_key, VOWEL_CENTROIDS["INDONESIAN"])
     voiced_indices: list[int] = []
     f1_list: list[float] = []
     f2_list: list[float] = []

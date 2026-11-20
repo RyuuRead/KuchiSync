@@ -63,6 +63,7 @@ class KeyframeEvent:
 class _MappedSegment:
     """Syllable mapped onto a target Shape Key with computed peak amplitude."""
 
+    orig_vowel: str
     shape_name: str
     start_frame: float
     end_frame: float
@@ -74,6 +75,7 @@ class _MappedSegment:
 class _SegmentPlan:
     """Mutable sparse Attack-Sustain-Release frame plan for one segment."""
 
+    orig_vowel: str
     shape_name: str
     s: float
     e: float
@@ -134,9 +136,10 @@ def _score_candidate(name: str, lower_name: str, vowel: str) -> tuple[int, int] 
         return (40, 20)
 
     for kana in _KANA_ALIASES[vowel]:
+        if kana in _SMALL_KANA:
+            continue
         if kana in name:
-            pref = 10 if kana in _SMALL_KANA else 25
-            return (40, pref)
+            return (40, 25)
 
     return None
 
@@ -344,6 +347,7 @@ def _merge_adjacent_same_shape(segments: Sequence[_MappedSegment]) -> list[_Mapp
                 continue
         merged.append(
             _MappedSegment(
+                orig_vowel=seg.orig_vowel,
                 shape_name=seg.shape_name,
                 start_frame=seg.start_frame,
                 end_frame=seg.end_frame,
@@ -371,6 +375,7 @@ def _build_initial_plan(seg: _MappedSegment, transition_frames: int) -> _Segment
     release_zero = max(last_active + 1, i_end + t_frames)
 
     return _SegmentPlan(
+        orig_vowel=seg.orig_vowel,
         shape_name=seg.shape_name,
         s=seg.start_frame,
         e=seg.end_frame,
@@ -457,7 +462,7 @@ def _resolve_same_shape_adjacent(
             prev.bridge_event = (dip_frame, dip_val)
             return
 
-        if preserve_syllables and not curr.valley_dip_before:
+        if preserve_syllables and not curr.valley_dip_before and prev.orig_vowel != curr.orig_vowel:
             # Remapped distinct vowels (e.g. E -> I) flow without snapping shut to 0.0.
             if prev.hold is not None and prev.hold[0] >= curr.attack:
                 prev.hold = None
@@ -526,6 +531,7 @@ def schedule_keyframes(
 
         mapped_segments.append(
             _MappedSegment(
+                orig_vowel=orig_vowel,
                 shape_name=shape_name,
                 start_frame=float(syl.start_frame),
                 end_frame=float(syl.end_frame),
@@ -815,6 +821,15 @@ def _strip_start(strip, default: float = 0.0) -> float:
     return default
 
 
+def _strip_visual_start(strip, default: float = 0.0) -> float:
+    """Read trimmed strip left boundary across Blender 5.2+ (left_handle) and 4.4-5.1 (frame_final_start)."""
+    for attr in ("left_handle", "frame_final_start", "content_start", "frame_start"):
+        val = getattr(strip, attr, None)
+        if val is not None:
+            return float(val)
+    return default
+
+
 def _strip_end(strip) -> float | None:
     """Read strip end frame across Blender 5.2+ (right_handle) and 4.4-5.1 (frame_final_end)."""
     for attr in ("right_handle", "frame_final_end"):
@@ -829,7 +844,7 @@ def _find_open_vse_channel(strips: Sequence, frame_start: int) -> int:
     occupied: set[int] = set()
     for strip in strips:
         ch = int(getattr(strip, "channel", 1))
-        s_start = _strip_start(strip, 0.0)
+        s_start = _strip_visual_start(strip, 0.0)
         s_end = _strip_end(strip)
         if s_end is None:
             if int(round(s_start)) == int(frame_start):

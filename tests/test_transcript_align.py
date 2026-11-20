@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import pathlib
+import sys
 import unittest
+from unittest import mock
 
 import numpy as np
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from kuchisync import transcript_align
 
@@ -125,6 +132,14 @@ class TestTranscriptAlign(unittest.TestCase):
             "faded": ["E", "I"],
             "table": ["E", "A"],
             "little": ["I", "A"],
+            "maple": ["E", "A"],
+            "bottle": ["O", "A"],
+            "coin": ["O", "I"],
+            "pulled": ["U"],
+            "called": ["O"],
+            "walled": ["O"],
+            "planned": ["A"],
+            "stopped": ["A"],
             "boxes": ["O", "I"],
             "makes": ["E"],
             "queen": ["I"],
@@ -224,6 +239,21 @@ class TestTranscriptAlign(unittest.TestCase):
         self.assertGreater(aligned[0].end_frame, 4.5)
         self.assertLess(aligned[0].end_frame, 9.5)
         self.assertAlmostEqual(aligned[0].end_frame, aligned[1].start_frame, places=4)
+
+        # Verify align_transcript passes normalized language to compute_speaker_normalized_scores.
+        eng_audio = np.concatenate([
+            _synth_formant_tone(780.0, 1320.0, 0.20, sr=16000),
+            _synth_formant_tone(325.0, 2300.0, 0.20, sr=16000),
+        ]).astype(np.float32)
+        with mock.patch(
+            "kuchisync.transcript_align.audio_dsp.compute_speaker_normalized_scores",
+            wraps=transcript_align.audio_dsp.compute_speaker_normalized_scores,
+        ) as norm_spy:
+            eng_aligned = transcript_align.align_transcript(
+                eng_audio, 16000, "pa see", "en", silence_threshold_db=-38.0, fps=24.0, start_frame=1
+            )
+        self.assertEqual([s.vowel for s in eng_aligned], ["A", "I"])
+        self.assertEqual(norm_spy.call_args.kwargs.get("language"), "ENGLISH")
 
 
 if __name__ == "__main__":
