@@ -155,17 +155,22 @@ class TestKeyframeGen(unittest.TestCase):
         i_vals = [k.value for k in scheduled["mouth_i"]]
         self.assertAlmostEqual(max(i_vals), 0.65, places=2)
 
-        # Distinct vowels with co_articulation=0.0 do not cross-fade overlap.
-        distinct_syl = [
-            AlignedSyllable("A", 5.0, 10.0, -16.0, False),
-            AlignedSyllable("I", 10.0, 15.0, -16.0, False),
-        ]
-        no_co = keyframe_gen.schedule_keyframes(
-            distinct_syl, {"A": "mouth_a", "I": "mouth_i"}, {"A": 1.0, "I": 1.0},
-            start_frame=1, max_mouth_open=1.0, min_phoneme_frames=3,
-            transition_frames=2, co_articulation=0.0, preserve_syllables=True
-        )
-        self.assertLessEqual(max(k.frame for k in no_co["mouth_a"]), min(k.frame for k in no_co["mouth_i"]))
+        # Distinct vowels with co_articulation=0.0 do not cross-fade overlap (gap <= T and T < gap < 2*T).
+        for gap_frames in (0.0, 3.0):
+            distinct_syl = [
+                AlignedSyllable("A", 5.0, 10.0, -16.0, False),
+                AlignedSyllable("I", 10.0 + gap_frames, 15.0 + gap_frames, -16.0, False),
+            ]
+            no_co = keyframe_gen.schedule_keyframes(
+                distinct_syl, {"A": "mouth_a", "I": "mouth_i"}, {"A": 1.0, "I": 1.0},
+                start_frame=1, max_mouth_open=1.0, min_phoneme_frames=3,
+                transition_frames=2, co_articulation=0.0, preserve_syllables=True
+            )
+            self.assertLessEqual(
+                max(k.frame for k in no_co["mouth_a"]),
+                min(k.frame for k in no_co["mouth_i"]),
+                msg=f"Unexpected overlap for co_articulation=0.0 at gap={gap_frames}",
+            )
 
     def test_mode_b_same_vowel_keeps_valley_dip(self):
         syllables = [
@@ -180,10 +185,14 @@ class TestKeyframeGen(unittest.TestCase):
         self.assertTrue(any(0.1 < v < 0.6 for v in vals))
 
     def test_slotted_action_writer_scoped_clear_and_vse_sync_mode(self):
+        existing_kp = _FakeKP(5, 0.8)
+        existing_kp.interpolation = "CONSTANT"
+        existing_kp.handle_left_type = "FREE"
+        existing_kp.handle_right_type = "VECTOR"
         fcurves_map = {
             'key_blocks["Blink"].value': _FakeFCurve('key_blocks["Blink"].value', [_FakeKP(5, 1.0)]),
             'key_blocks["mouth_a"].value': _FakeFCurve(
-                'key_blocks["mouth_a"].value', [_FakeKP(5, 0.8), _FakeKP(50, 0.9)]
+                'key_blocks["mouth_a"].value', [existing_kp, _FakeKP(50, 0.9)]
             ),
         }
 
@@ -228,6 +237,12 @@ class TestKeyframeGen(unittest.TestCase):
         self.assertEqual(written, 1)
         self.assertGreaterEqual(kb_a.slider_max, 1.15)
         self.assertEqual(fcurves_map['key_blocks["mouth_a"].value'].keyframe_points[-1].handle_left_type, "AUTO_CLAMPED")
+        # Pre-existing keyframe at frame 5 keeps its original interpolation and handles.
+        preserved_kp = fcurves_map['key_blocks["mouth_a"].value'].keyframe_points[0]
+        self.assertEqual(preserved_kp.co[0], 5.0)
+        self.assertEqual(preserved_kp.interpolation, "CONSTANT")
+        self.assertEqual(preserved_kp.handle_left_type, "FREE")
+        self.assertEqual(preserved_kp.handle_right_type, "VECTOR")
 
         created = []
 
@@ -382,6 +397,56 @@ class TestKeyframeGen(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             keyframe_gen.apply_keyframes_to_object(type("Obj", (), {})(), {}, "INVALID_MODE")
+
+    def test_clear_lipsync_keyframes_multi_delete_revalidates_indices_on_realloc(self):
+        class ReallocProxy:
+            def __init__(self, backing_kp, gen, container):
+                self._kp = backing_kp
+                self._gen = gen
+                self._container = container
+
+            @property
+            def co(self):
+                if self._gen != self._container.gen:
+                    raise RuntimeError("Stale PointerRNA reference after reallocation")
+                return self._kp.co
+
+        class ReallocKPs:
+            def __init__(self, items):
+                self._items = list(items)
+                self.gen = 0
+
+            def __len__(self):
+                return len(self._items)
+
+            def __getitem__(self, idx):
+                return ReallocProxy(self._items[idx], self.gen, self)
+
+            def __iter__(self):
+                snapshot_gen = self.gen
+                for idx in range(len(self._items)):
+                    yield ReallocProxy(self._items[idx], snapshot_gen, self)
+
+            def remove(self, proxy, fast=False):
+                del fast
+                if proxy._gen != self.gen:
+                    raise RuntimeError("Keyframe not found in F-Curve")
+                self._items.remove(proxy._kp)
+                self.gen += 1
+
+        fc_a = _FakeFCurve('key_blocks["mouth_a"].value')
+        fc_a.keyframe_points = ReallocKPs(
+            [_FakeKP(5, 0.4), _FakeKP(20, 0.8), _FakeKP(25, 1.0), _FakeKP(30, 0.2), _FakeKP(50, 0.9)]
+        )
+        action = type("Action", (), {"fcurves": [fc_a]})()
+        anim = type("Anim", (), {"action": action})()
+        sk = type("SK", (), {"animation_data": anim, "key_blocks": {}})()
+        obj = type("Obj", (), {"data": type("D", (), {"shape_keys": sk})()})()
+
+        removed = keyframe_gen.clear_lipsync_keyframes(obj, ["mouth_a"], frame_range=(20, 30))
+        self.assertEqual(removed, 3)
+        self.assertEqual([kp.co[0] for kp in fc_a.keyframe_points], [5.0, 50.0])
+        self.assertTrue(fc_a.updated)
 
 
 if __name__ == "__main__":
