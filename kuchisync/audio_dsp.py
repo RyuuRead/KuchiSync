@@ -16,17 +16,27 @@ TARGET_SAMPLE_RATE: int = 16000
 FRAME_MS: float = 25.0
 HOP_MS: float = 10.0
 PRE_EMPHASIS: float = 0.97
-LPC_ORDER: int = 16
+LPC_ORDER: int = 14
 MIN_FORMANT_HZ: float = 200.0
-MAX_FORMANT_HZ: float = 3500.0
-MAX_BANDWIDTH_HZ: float = 600.0
+MAX_FORMANT_HZ: float = 3000.0
+MAX_BANDWIDTH_HZ: float = 550.0
 SIGMA_F1: float = 130.0
 SIGMA_F2: float = 260.0
+_SCORE_SIGMA_F1: float = 115.0
+_SCORE_SIGMA_F2: float = 275.0
+_MAX_SCALED_F1_HZ: float = 1250.0
+_SMOOTH_OFFSETS: tuple[tuple[int, float], ...] = ((-2, 0.10), (-1, 0.20), (0, 0.40), (1, 0.20), (2, 0.10))
 
 VOICE_TYPE_SCALES: dict[str, tuple[float, float]] = {
     "HIGH_CHILD": (1.16, 1.18),
     "FEMALE_STANDARD": (1.00, 1.00),
     "MALE_DEEP": (0.85, 0.87),
+}
+
+_VOICE_BANDPASS_HZ: dict[str, tuple[float, float]] = {
+    "HIGH_CHILD": (295.0, 3250.0),
+    "FEMALE_STANDARD": (265.0, 2950.0),
+    "MALE_DEEP": (215.0, 2900.0),
 }
 
 VOWEL_CENTROIDS: dict[str, dict[str, tuple[float, float]]] = {
@@ -44,6 +54,14 @@ VOWEL_CENTROIDS: dict[str, dict[str, tuple[float, float]]] = {
         "E": (550.0, 1950.0),
         "O": (550.0, 925.0),
     },
+}
+
+_ENGLISH_PROTOTYPES: dict[str, tuple[tuple[float, float], ...]] = {
+    "A": ((780.0, 1320.0), (880.0, 1820.0)),
+    "I": ((340.0, 2450.0),),
+    "U": ((365.0, 840.0),),
+    "E": ((530.0, 1950.0),),
+    "O": ((550.0, 930.0),),
 }
 
 _scipy_checked: bool = False
@@ -467,7 +485,13 @@ def _levinson_durbin(r: np.ndarray, order: int) -> np.ndarray:
     return a
 
 
-def _extract_formants(xw: np.ndarray, sr: int, order: int = LPC_ORDER) -> tuple[float | None, float | None]:
+def _extract_formants(
+    xw: np.ndarray,
+    sr: int,
+    order: int = LPC_ORDER,
+    min_hz: float = MIN_FORMANT_HZ,
+    max_hz: float = MAX_FORMANT_HZ,
+) -> tuple[float | None, float | None]:
     """Estimate lowest two vocal tract resonances (F1, F2) from LPC polynomial roots."""
     n = len(xw)
     r = np.array([np.dot(xw[: n - k], xw[k:]) for k in range(order + 1)], dtype=np.float64)
@@ -489,7 +513,7 @@ def _extract_formants(xw: np.ndarray, sr: int, order: int = LPC_ORDER) -> tuple[
     valid = sorted(
         float(freq)
         for freq, bw in zip(freqs, bws)
-        if MIN_FORMANT_HZ <= freq <= MAX_FORMANT_HZ and bw <= MAX_BANDWIDTH_HZ
+        if min_hz <= freq <= max_hz and bw <= MAX_BANDWIDTH_HZ
     )
     if len(valid) >= 2:
         return valid[0], valid[1]
@@ -498,16 +522,34 @@ def _extract_formants(xw: np.ndarray, sr: int, order: int = LPC_ORDER) -> tuple[
     return None, None
 
 
+def _normalize_language_key(language: str) -> str:
+    """Normalize language aliases into INDONESIAN or ENGLISH."""
+    lang_key = str(language or "INDONESIAN").strip().upper()
+    if lang_key in ("ENGLISH", "EN", "ENG"):
+        return "ENGLISH"
+    return "INDONESIAN" if lang_key not in VOWEL_CENTROIDS else lang_key
+
+
 def _score_formants(
     f1: float,
     f2: float,
     centroids: dict[str, tuple[float, float]],
+    language: str = "INDONESIAN",
 ) -> dict[str, float]:
     """Compute normalized Gaussian softmax scores for (f1, f2) across A-I-U-E-O."""
-    log_likes = {
-        v: -0.5 * (((f1 - c1) / SIGMA_F1) ** 2 + ((f2 - c2) / SIGMA_F2) ** 2)
-        for v, (c1, c2) in centroids.items()
-    }
+    if _normalize_language_key(language) == "ENGLISH":
+        log_likes = {
+            v: max(
+                -0.5 * (((f1 - c1) / _SCORE_SIGMA_F1) ** 2 + ((f2 - c2) / _SCORE_SIGMA_F2) ** 2)
+                for c1, c2 in _ENGLISH_PROTOTYPES[v]
+            )
+            for v in VOWELS
+        }
+    else:
+        log_likes = {
+            v: -0.5 * (((f1 - c1) / SIGMA_F1) ** 2 + ((f2 - c2) / SIGMA_F2) ** 2)
+            for v, (c1, c2) in centroids.items()
+        }
     max_ll = max(log_likes.values())
     exps = {v: math.exp(val - max_ll) for v, val in log_likes.items()}
     total = sum(exps.values())
@@ -542,7 +584,7 @@ def analyze_audio_frames(
     voice_type: str = "FEMALE_STANDARD",
     language: str = "INDONESIAN",
 ) -> list[FormantFrame]:
-    """Run 25ms/10ms VAD and order-16 LPC formant tracking over mono audio."""
+    """Run 25ms/10ms VAD, pitch-protected bandpass, and LPC formant tracking."""
     if sr <= 0:
         raise ValueError(f"Sample rate must be positive (got {sr})")
 
@@ -567,20 +609,26 @@ def analyze_audio_frames(
         work = mono.astype(np.float64)
         starts = list(range(0, orig_len - frame_len + 1, hop_len))
 
-    emph = np.empty_like(work)
-    emph[0] = work[0]
-    emph[1:] = work[1:] - PRE_EMPHASIS * work[:-1]
+    voice_key = str(voice_type or "FEMALE_STANDARD").upper()
+    scale_f1, scale_f2 = VOICE_TYPE_SCALES.get(voice_key, (1.00, 1.00))
+    bp_low, bp_high = _VOICE_BANDPASS_HZ.get(voice_key, (265.0, 2950.0))
+    lang_key = _normalize_language_key(language)
+    centroids = VOWEL_CENTROIDS.get(lang_key, VOWEL_CENTROIDS["INDONESIAN"])
+
+    vocal = bandpass_vocal(work.astype(np.float32), work_sr, low_hz=bp_low, high_hz=bp_high).astype(
+        np.float64
+    )
+    emph = np.empty_like(vocal)
+    emph[0] = vocal[0]
+    emph[1:] = vocal[1:] - PRE_EMPHASIS * vocal[:-1]
 
     window = np.hamming(frame_len)
     fft_freqs = np.fft.rfftfreq(frame_len, d=1.0 / float(work_sr))
     mid_mask = (fft_freqs >= 200.0) & (fft_freqs <= 3000.0)
     high_mask = (fft_freqs >= 3500.0) & (fft_freqs <= 8000.0)
-
-    scale_f1, scale_f2 = VOICE_TYPE_SCALES.get(str(voice_type).upper(), (1.00, 1.00))
-    centroids = VOWEL_CENTROIDS.get(str(language).upper(), VOWEL_CENTROIDS["INDONESIAN"])
     zero_scores = {v: 0.0 for v in VOWELS}
 
-    results: list[FormantFrame] = []
+    raw_extracted: list[tuple[float, float, float, bool, float | None, float | None]] = []
     for start in starts:
         raw_frame = work[start : start + frame_len]
         if orig_len < frame_len:
@@ -593,7 +641,7 @@ def analyze_audio_frames(
         zcr = float(np.mean((raw_frame[:-1] * raw_frame[1:]) < 0.0))
 
         if rms_db < silence_threshold_db:
-            results.append(_unvoiced_frame(time_sec, rms_db, zcr, zero_scores))
+            raw_extracted.append((time_sec, rms_db, zcr, False, None, None))
             continue
 
         if zcr > 0.35:
@@ -601,42 +649,82 @@ def analyze_audio_frames(
             mid_energy = float(np.sum(spec[mid_mask]))
             high_energy = float(np.sum(spec[high_mask]))
             if rms_db < silence_threshold_db + 12.0 or high_energy > 1.5 * max(mid_energy, 1e-18):
-                results.append(_unvoiced_frame(time_sec, rms_db, zcr, zero_scores))
+                raw_extracted.append((time_sec, rms_db, zcr, False, None, None))
                 continue
 
         xw = emph[start : start + frame_len] * window
-        f1, f2 = _extract_formants(xw, work_sr, LPC_ORDER)
+        f1, f2 = _extract_formants(xw, work_sr, LPC_ORDER, min_hz=bp_low, max_hz=bp_high)
 
-        if f1 is not None and f2 is not None:
-            scores = _score_formants(f1 / scale_f1, f2 / scale_f2, centroids)
-            vowel = max(VOWELS, key=scores.__getitem__)
-            results.append(
-                FormantFrame(
-                    time_sec=time_sec,
-                    f1=f1,
-                    f2=f2,
-                    rms_db=rms_db,
-                    zcr=zcr,
-                    is_voiced=True,
-                    vowel=vowel,
-                    scores=scores,
-                )
-            )
-        elif f1 is not None:
-            results.append(
-                FormantFrame(
-                    time_sec=time_sec,
-                    f1=f1,
-                    f2=None,
-                    rms_db=rms_db,
-                    zcr=zcr,
-                    is_voiced=True,
-                    vowel=None,
-                    scores={v: 0.2 for v in VOWELS},
-                )
-            )
+        if f1 is not None and f2 is not None and (f1 / scale_f1) <= _MAX_SCALED_F1_HZ:
+            raw_extracted.append((time_sec, rms_db, zcr, True, f1, f2))
         else:
-            results.append(_unvoiced_frame(time_sec, rms_db, zcr, zero_scores))
+            raw_extracted.append((time_sec, rms_db, zcr, False, None, None))
+
+    # Median-smooth extracted formants across immediate voiced neighbors (up to +-2 hops / 20 ms)
+    # so 1-2 hop glitches drop cleanly without blending distant vowels into a fake middle vowel.
+    n_frames = len(raw_extracted)
+    raw_results: list[FormantFrame] = []
+    for idx, (time_sec, rms_db, zcr, is_v, f1, f2) in enumerate(raw_extracted):
+        if not is_v or f1 is None or f2 is None:
+            raw_results.append(_unvoiced_frame(time_sec, rms_db, zcr, zero_scores))
+            continue
+
+        nbr_f1: list[float] = []
+        nbr_f2: list[float] = []
+        for off in (-1, 0, 1):
+            nbr_idx = idx + off
+            if 0 <= nbr_idx < n_frames:
+                nv, nf1, nf2 = raw_extracted[nbr_idx][3], raw_extracted[nbr_idx][4], raw_extracted[nbr_idx][5]
+                if nv and nf1 is not None and nf2 is not None:
+                    nbr_f1.append(nf1)
+                    nbr_f2.append(nf2)
+        f1_med = float(np.median(nbr_f1))
+        f2_med = float(np.median(nbr_f2))
+        scores = _score_formants(f1_med / scale_f1, f2_med / scale_f2, centroids, language=lang_key)
+        raw_results.append(
+            FormantFrame(
+                time_sec=time_sec,
+                f1=f1_med,
+                f2=f2_med,
+                rms_db=rms_db,
+                zcr=zcr,
+                is_voiced=True,
+                vowel=max(VOWELS, key=scores.__getitem__),
+                scores=scores,
+            )
+        )
+
+    # Smooth likelihoods over adjacent voiced hops (~50 ms) to stabilize vowel boundaries.
+    results: list[FormantFrame] = []
+    for idx, frame in enumerate(raw_results):
+        if not frame.is_voiced:
+            results.append(frame)
+            continue
+        acc = {v: 0.0 for v in VOWELS}
+        w_sum = 0.0
+        for offset, weight in _SMOOTH_OFFSETS:
+            nbr_idx = idx + offset
+            if 0 <= nbr_idx < n_frames and raw_results[nbr_idx].is_voiced:
+                nbr_scores = raw_results[nbr_idx].scores
+                for v in VOWELS:
+                    acc[v] += weight * nbr_scores[v]
+                w_sum += weight
+        if w_sum > 0.0:
+            smoothed = {v: acc[v] / w_sum for v in VOWELS}
+        else:
+            smoothed = dict(frame.scores)
+        results.append(
+            FormantFrame(
+                time_sec=frame.time_sec,
+                f1=frame.f1,
+                f2=frame.f2,
+                rms_db=frame.rms_db,
+                zcr=frame.zcr,
+                is_voiced=True,
+                vowel=max(VOWELS, key=smoothed.__getitem__),
+                scores=smoothed,
+            )
+        )
 
     return results
 
@@ -683,9 +771,7 @@ def compute_speaker_normalized_scores(
     if not frames:
         return []
 
-    lang_key = str(language or "INDONESIAN").strip().upper()
-    if lang_key in ("ENGLISH", "EN", "ENG"):
-        lang_key = "ENGLISH"
+    lang_key = _normalize_language_key(language)
     centroids = VOWEL_CENTROIDS.get(lang_key, VOWEL_CENTROIDS["INDONESIAN"])
     voiced_indices: list[int] = []
     f1_list: list[float] = []
@@ -707,6 +793,8 @@ def compute_speaker_normalized_scores(
     for idx in voiced_indices:
         frame = frames[idx]
         if frame.f1 is not None and frame.f2 is not None:
-            out[idx] = _score_formants(frame.f1 / scale_f1, frame.f2 / scale_f2, centroids)
+            out[idx] = _score_formants(
+                frame.f1 / scale_f1, frame.f2 / scale_f2, centroids, language=lang_key
+            )
 
     return out

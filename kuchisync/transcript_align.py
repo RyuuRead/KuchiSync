@@ -1213,8 +1213,14 @@ def _match_phrases_to_islands(
             assignments.append((isl_idx, islands[isl_idx], merged_targets))
         return assignments
 
-    # More speech islands than phrases: group islands to phrases, then split targets cleanly.
-    island_slices = _partition_by_proportions(island_masses, phrase_weights)
+    # More speech islands than phrases: group islands to phrases using both energy mass and silence gaps.
+    gap_bonuses = [0.0] * (m_count + 1)
+    gaps = [max(0, islands[idx][0] - islands[idx - 1][1]) for idx in range(1, m_count)]
+    max_gap = max(gaps) if gaps else 0
+    if max_gap > 0:
+        for idx, g_val in enumerate(gaps, start=1):
+            gap_bonuses[idx] = 0.25 * (float(g_val) / float(max_gap))
+    island_slices = _partition_by_proportions(island_masses, phrase_weights, boundary_bonuses=gap_bonuses)
     assignments = []
     for p_idx, (is_s, is_e) in enumerate(island_slices):
         sub_islands = islands[is_s:is_e]
@@ -1360,15 +1366,6 @@ def _align_island_targets(
         mu[k] = 0.5 * (c0 + c1)
 
     slack = max(0.45, 2.5 / float(k_count))
-    t_lo = np.empty(k_count, dtype=np.int32)
-    t_hi = np.empty(k_count, dtype=np.int32)
-    for k in range(k_count):
-        lo = max(k, int(math.floor((c_bounds[k, 0] - slack) * n_frames)))
-        hi = min(n_frames - (k_count - k), int(math.ceil((c_bounds[k, 1] + slack) * n_frames)) - 1)
-        lo = min(lo, n_frames - (k_count - k))
-        hi = max(hi, lo)
-        t_lo[k] = lo
-        t_hi[k] = hi
 
     # Precompute frame emission costs (speaker-normalized formants + position prior).
     frame_cost = np.empty((k_count, n_frames), dtype=np.float64)
@@ -1393,42 +1390,80 @@ def _align_island_targets(
                 formant_term = 0.0
             frame_cost[k, t] = formant_term + pos_term
 
+    # Enforce minimum dwell hops per syllable when frames allow to prevent 10ms collapsed slivers.
+    if n_frames >= 4 * k_count:
+        min_dwell = 3
+    elif n_frames >= 2 * k_count:
+        min_dwell = 2
+    else:
+        min_dwell = 1
+
+    pref_cost = np.zeros((k_count, n_frames + 1), dtype=np.float64)
+    pref_cost[:, 1:] = np.cumsum(frame_cost, axis=1)
+
+    t_lo = np.empty(k_count, dtype=np.int32)
+    t_hi = np.empty(k_count, dtype=np.int32)
+    for k in range(k_count):
+        hard_lo = (k + 1) * min_dwell - 1
+        hard_hi = n_frames - 1 - (k_count - 1 - k) * min_dwell
+        if k == k_count - 1:
+            t_lo[k] = min(hard_hi, max(hard_lo, int(t_lo[k - 1]) + min_dwell))
+            t_hi[k] = n_frames - 1
+            continue
+        band_lo = int(math.floor((c_bounds[k, 1] - slack) * float(n_frames))) - 1
+        band_hi = int(math.ceil((c_bounds[k, 1] + slack) * float(n_frames))) - 1
+        lo = min(hard_hi, max(hard_lo, band_lo))
+        hi = max(lo, min(hard_hi, band_hi))
+        if k > 0:
+            lo = min(lo, min(hard_hi, int(t_hi[k - 1]) + min_dwell))
+            hi = max(lo, min(hard_hi, max(hi, int(t_lo[k - 1]) + min_dwell)))
+        t_lo[k] = lo
+        t_hi[k] = hi
+
     inf = 1e18
     dp = np.full((k_count, n_frames), inf, dtype=np.float64)
+    # back[k, t] == 0 extends syllable k from t-1; 1 begins syllable k's min_dwell block at t - min_dwell + 1.
     back = np.zeros((k_count, n_frames), dtype=np.int8)
-    dp[0, 0] = float(frame_cost[0, 0])
 
-    for t in range(1, n_frames):
-        sw = float(switch_cost[t])
-        for k in range(k_count):
-            if t < t_lo[k] or t > t_hi[k]:
-                continue
-            best = float(dp[k, t - 1])
-            step = 0
-            if k > 0:
-                cand = float(dp[k - 1, t - 1]) + sw
-                if cand < best:
-                    best = cand
-                    step = 1
-            if best < inf * 0.5:
-                dp[k, t] = best + float(frame_cost[k, t])
-                back[k, t] = step
+    for t in range(int(t_lo[0]), int(t_hi[0]) + 1):
+        dp[0, t] = float(pref_cost[0, t + 1])
 
-    # Backtrack frame assignments from (k_count - 1, n_frames - 1) to (0, 0).
-    assigned_k = [0] * n_frames
+    for k in range(1, k_count):
+        for t in range(int(t_lo[k]), int(t_hi[k]) + 1):
+            best = inf
+            best_step = 0
+            if t - 1 >= int(t_lo[k]) and dp[k, t - 1] < inf * 0.5:
+                cand_ext = float(dp[k, t - 1]) + float(frame_cost[k, t])
+                if cand_ext < best:
+                    best = cand_ext
+                    best_step = 0
+            prev_end = t - min_dwell
+            if prev_end >= 0 and dp[k - 1, prev_end] < inf * 0.5:
+                block_cost = float(pref_cost[k, t + 1] - pref_cost[k, prev_end + 1])
+                cand_sw = float(dp[k - 1, prev_end]) + float(switch_cost[prev_end + 1]) + block_cost
+                if cand_sw < best:
+                    best = cand_sw
+                    best_step = 1
+            dp[k, t] = best
+            back[k, t] = best_step
+
+    spans_rev: list[tuple[int, int]] = []
     cur_k = k_count - 1
-    for t in range(n_frames - 1, -1, -1):
-        assigned_k[t] = cur_k
-        if t > 0 and back[cur_k, t] == 1:
+    cur_t = n_frames - 1
+    cur_end = n_frames
+    while cur_k >= 0:
+        if cur_k == 0:
+            spans_rev.append((s_idx, s_idx + cur_end))
+            break
+        if back[cur_k, cur_t] == 1:
+            start_local = cur_t - min_dwell + 1
+            spans_rev.append((s_idx + start_local, s_idx + cur_end))
             cur_k -= 1
-
-    spans: list[tuple[int, int]] = []
-    run_start = 0
-    for t in range(1, n_frames):
-        if assigned_k[t] != assigned_k[t - 1]:
-            spans.append((s_idx + run_start, s_idx + t))
-            run_start = t
-    spans.append((s_idx + run_start, e_idx))
+            cur_t = start_local - 1
+            cur_end = cur_t + 1
+        else:
+            cur_t -= 1
+    spans = list(reversed(spans_rev))
 
     out = []
     for k, (hop_lo, hop_hi) in enumerate(spans):

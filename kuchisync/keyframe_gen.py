@@ -238,10 +238,120 @@ def _merge_close_identical_segments(
                 start_frame=seg.start_frame,
                 end_frame=seg.end_frame,
                 peak_rms_db=seg.peak_rms_db,
-                valley_dip_before=False,
+                valley_dip_before=seg.valley_dip_before,
             )
         )
     return merged
+
+
+def _consolidate_short_mode_a_run(
+    run: Sequence[AlignedSyllable],
+    min_frames: float,
+) -> list[AlignedSyllable]:
+    """Coalesce a contiguous short voiced run into min_frames-sized dominant vowel segments."""
+    items: list[list] = [
+        [
+            seg.vowel,
+            float(seg.start_frame),
+            float(seg.end_frame),
+            float(seg.peak_rms_db),
+            bool(seg.valley_dip_before),
+            {
+                seg.vowel: max(0.05, float(seg.end_frame) - float(seg.start_frame))
+                * (10.0 ** (float(seg.peak_rms_db) / 20.0))
+            },
+        ]
+        for seg in run
+    ]
+    while len(items) > 1 and any((x[2] - x[1]) + 1e-6 < min_frames for x in items):
+        short_idx = min(range(len(items)), key=lambda idx: items[idx][2] - items[idx][1])
+        if (items[short_idx][2] - items[short_idx][1]) + 1e-6 >= min_frames:
+            break
+        cur_v = items[short_idx][0]
+        cands = []
+        if short_idx > 0:
+            cands.append(short_idx - 1)
+        if short_idx + 1 < len(items):
+            cands.append(short_idx + 1)
+        best_nbr = max(
+            cands,
+            key=lambda j: (
+                1 if items[j][0] == cur_v else 0,
+                1 if (items[j][2] - items[j][1]) + 1e-6 < min_frames else 0,
+                -(items[j][2] - items[j][1]),
+            ),
+        )
+        lo, hi = min(short_idx, best_nbr), max(short_idx, best_nbr)
+        left, right = items[lo], items[hi]
+        masses = dict(left[5])
+        for vowel, mass in right[5].items():
+            masses[vowel] = masses.get(vowel, 0.0) + mass
+        dom_vowel = max(masses, key=masses.__getitem__)
+        items[lo : hi + 1] = [
+            [
+                dom_vowel,
+                left[1],
+                right[2],
+                max(left[3], right[3]),
+                left[4],
+                masses,
+            ]
+        ]
+    return [AlignedSyllable(x[0], x[1], x[2], x[3], x[4]) for x in items]
+
+
+def _split_mode_a_segment_valleys(
+    seg: AlignedSyllable,
+    onset_frames: Sequence[tuple[float, float]],
+    min_phoneme_frames: int,
+) -> list[AlignedSyllable]:
+    """Split a long continuous vowel segment where RMS dips >= 5 dB between clear syllable peaks."""
+    min_child = max(2.0, 0.75 * float(max(1, min_phoneme_frames)))
+    if (seg.end_frame - seg.start_frame) < 2.0 * min_child:
+        return [seg]
+
+    pts = [(fr_pos, db) for (fr_pos, db) in onset_frames if seg.start_frame - 0.15 <= fr_pos <= seg.end_frame + 0.15]
+    if len(pts) < 6:
+        return [seg]
+
+    best_split: tuple[float, float, float, float] | None = None
+    best_drop = 0.0
+    for idx in range(2, len(pts) - 2):
+        split_f, val_db = pts[idx]
+        if (split_f - seg.start_frame) < min_child or (seg.end_frame - split_f) < min_child:
+            continue
+        left_peaks = [db for (pos, db) in pts[:idx] if pos <= split_f - 0.5]
+        right_peaks = [db for (pos, db) in pts[idx + 1 :] if pos >= split_f + 0.5]
+        if not left_peaks or not right_peaks:
+            continue
+        l_max = max(left_peaks)
+        r_max = max(right_peaks)
+        drop = min(l_max, r_max) - val_db
+        if drop >= 5.0 and drop > best_drop:
+            best_drop = drop
+            best_split = (split_f, l_max, r_max, min_child)
+
+    if best_split is None:
+        return [seg]
+
+    split_f, l_max, r_max, _ = best_split
+    left_seg = AlignedSyllable(
+        vowel=seg.vowel,
+        start_frame=seg.start_frame,
+        end_frame=split_f,
+        peak_rms_db=l_max,
+        valley_dip_before=seg.valley_dip_before,
+    )
+    right_seg = AlignedSyllable(
+        vowel=seg.vowel,
+        start_frame=split_f,
+        end_frame=seg.end_frame,
+        peak_rms_db=r_max,
+        valley_dip_before=True,
+    )
+    return _split_mode_a_segment_valleys(left_seg, onset_frames, min_phoneme_frames) + _split_mode_a_segment_valleys(
+        right_seg, onset_frames, min_phoneme_frames
+    )
 
 
 def build_mode_a_segments(
@@ -250,14 +360,23 @@ def build_mode_a_segments(
     start_frame: int,
     min_phoneme_frames: int,
 ) -> list[AlignedSyllable]:
-    """Aggregate voiced FormantFrames into merged and spike-filtered Mode A segments."""
+    """Aggregate voiced FormantFrames into merged, consolidated, and valley-split Mode A segments."""
     if fps <= 0.0:
         raise ValueError(f"fps must be positive (got {fps})")
     if not frames:
         return []
 
     hop_sec = _estimate_hop_sec(frames)
+    # Compensate 25ms window center plus brief visual speech anticipation when frames start past 0s.
+    lead_sec = 0.025 if frames[0].time_sec > 0.5 * hop_sec else 0.0
     raw_segments: list[AlignedSyllable] = []
+
+    def _to_frame(t_sec: float) -> float:
+        return float(start_frame) + max(0.0, t_sec - lead_sec) * float(fps)
+
+    onset_rms: list[tuple[float, float]] = [
+        (_to_frame(fr.time_sec), float(fr.rms_db)) for fr in frames
+    ]
 
     cur_vowel: str | None = None
     cur_start_t = 0.0
@@ -271,8 +390,8 @@ def build_mode_a_segments(
         raw_segments.append(
             AlignedSyllable(
                 vowel=cur_vowel,
-                start_frame=float(start_frame) + cur_start_t * float(fps),
-                end_frame=float(start_frame) + cur_end_t * float(fps),
+                start_frame=_to_frame(cur_start_t),
+                end_frame=_to_frame(cur_end_t),
                 peak_rms_db=cur_peak_db,
                 valley_dip_before=False,
             )
@@ -304,30 +423,61 @@ def build_mode_a_segments(
     # Bridge single-hop unvoiced dropouts inside steady vowels first.
     segments = _merge_close_identical_segments(raw_segments, fps=float(fps))
 
-    # Drop sub-frame 1-2 hop transient glitches before final duration filtering so steady runs heal.
+    # Drop tiny sub-frame noise glitches before consolidating steady speech.
     min_frames = max(0.0, float(min_phoneme_frames))
-    glitch_cutoff = min(1.0, min_frames)
+    glitch_cutoff = min(0.75, min_frames)
     if glitch_cutoff > 0.0:
         segments = [s for s in segments if (s.end_frame - s.start_frame) + 1e-6 >= glitch_cutoff]
         segments = _merge_close_identical_segments(segments, fps=float(fps))
 
-    if min_frames > 0.0:
-        segments = [s for s in segments if (s.end_frame - s.start_frame) + 1e-6 >= min_frames]
-        segments = _merge_close_identical_segments(segments, fps=float(fps))
+    if min_frames > 0.0 and segments:
+        consolidated: list[AlignedSyllable] = []
+        idx = 0
+        while idx < len(segments):
+            if (segments[idx].end_frame - segments[idx].start_frame) + 1e-6 >= min_frames:
+                consolidated.append(segments[idx])
+                idx += 1
+                continue
+            j = idx + 1
+            while (
+                j < len(segments)
+                and (segments[j].end_frame - segments[j].start_frame) + 1e-6 < min_frames
+                and (segments[j].start_frame - segments[j - 1].end_frame) <= 1.2
+            ):
+                j += 1
+            short_run = segments[idx:j]
+            if (short_run[-1].end_frame - short_run[0].start_frame) + 1e-6 >= min_frames:
+                consolidated.extend(_consolidate_short_mode_a_run(short_run, min_frames))
+            idx = j
+        segments = _merge_close_identical_segments(consolidated, fps=float(fps))
+
+    if min_phoneme_frames > 0 and segments:
+        valley_split: list[AlignedSyllable] = []
+        for seg in segments:
+            valley_split.extend(_split_mode_a_segment_valleys(seg, onset_rms, min_phoneme_frames))
+        segments = valley_split
 
     return segments
 
 
 def _compute_energy_scales(syllables: Sequence[AlignedSyllable]) -> list[float]:
-    """Scale each syllable's peak amplitude in [0.65, 1.0] from voiced utterance RMS range."""
+    """Scale each syllable's peak amplitude in [0.65, 1.0] using outlier-resistant utterance bounds."""
     if not syllables:
         return []
     rms_vals = [float(s.peak_rms_db) for s in syllables]
-    rms_min = min(rms_vals)
-    rms_max = max(rms_vals)
+    n = len(rms_vals)
+    if n >= 6:
+        ordered = sorted(rms_vals)
+        lo_idx = min(n - 1, int(round(0.15 * float(n - 1))))
+        hi_idx = max(lo_idx, min(n - 1, int(0.85 * float(n - 1))))
+        rms_min = ordered[lo_idx]
+        rms_max = ordered[hi_idx]
+    else:
+        rms_min = min(rms_vals)
+        rms_max = max(rms_vals)
     span = rms_max - rms_min
     if span <= 0.5:
-        return [1.0] * len(syllables)
+        return [1.0] * n
     scales: list[float] = []
     for val in rms_vals:
         rel = min(1.0, max(0.0, (val - rms_min) / span))
@@ -341,7 +491,11 @@ def _merge_adjacent_same_shape(segments: Sequence[_MappedSegment]) -> list[_Mapp
     for seg in segments:
         if merged:
             prev = merged[-1]
-            if seg.shape_name == prev.shape_name and (seg.start_frame - prev.end_frame) <= 1.0 + 1e-6:
+            if (
+                seg.shape_name == prev.shape_name
+                and not seg.valley_dip_before
+                and (seg.start_frame - prev.end_frame) <= 1.0 + 1e-6
+            ):
                 prev.end_frame = max(prev.end_frame, seg.end_frame)
                 prev.peak = max(prev.peak, seg.peak)
                 continue
@@ -448,7 +602,7 @@ def _resolve_same_shape_adjacent(
     gap = curr.s - prev.e
 
     if gap <= float(t_frames) + 1e-6:
-        if preserve_syllables and curr.valley_dip_before:
+        if curr.valley_dip_before:
             dip_val = 0.35 * min(prev.peak, curr.peak)
             dip_frame = int(round(0.5 * (prev.i_end + curr.i_start)))
             if prev.hold is not None and dip_frame <= prev.hold[0]:
