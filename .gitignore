@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 dist/
+.superpowers/
+docs/
+DESIGN.md
+Technical Specification Blender.md
