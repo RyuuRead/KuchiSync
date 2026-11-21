@@ -633,6 +633,58 @@ class TestKeyframeGen(unittest.TestCase):
         keyframe_gen.add_audio_to_vse(scene_45, "/tmp/overlap45.wav", 35)
         self.assertEqual(created_45[-1].channel, 2)
 
+    def test_mode_a_consolidates_short_word_and_splits_energy_valleys(self):
+        # 1) Continuous word fragmented across 3 short runs (each < 3f, combined 6f >= 3f) survives min_phoneme_frames=3.
+        frames = []
+        # 0.00..0.09s: O (10 hops = ~2.4 frames, loudest -16 dB)
+        for i in range(10):
+            frames.append(_make_frame(0.0125 + i * 0.01, "O", rms_db=-16.0, is_voiced=True))
+        # 0.10..0.17s: A (8 hops = ~1.9 frames, -19 dB)
+        for i in range(10, 18):
+            frames.append(_make_frame(0.0125 + i * 0.01, "A", rms_db=-19.0, is_voiced=True))
+        # 0.18..0.24s: U (7 hops = ~1.7 frames, -21 dB)
+        for i in range(18, 25):
+            frames.append(_make_frame(0.0125 + i * 0.01, "U", rms_db=-21.0, is_voiced=True))
+
+        segs = keyframe_gen.build_mode_a_segments(frames, fps=24.0, start_frame=1, min_phoneme_frames=3)
+        self.assertGreaterEqual(len(segs), 1)
+        total_span = segs[-1].end_frame - segs[0].start_frame
+        self.assertGreaterEqual(total_span, 4.5)
+
+        # 2) Long continuous same-vowel run with a >= 6 dB interior RMS valley splits and articulates.
+        valley_frames = []
+        for i in range(42):
+            if 16 <= i <= 21:
+                db = -27.0
+            else:
+                db = -14.0
+            valley_frames.append(_make_frame(0.0125 + i * 0.01, "A", rms_db=db, is_voiced=True))
+        v_segs = keyframe_gen.build_mode_a_segments(
+            valley_frames, fps=24.0, start_frame=1, min_phoneme_frames=3
+        )
+        self.assertEqual([s.vowel for s in v_segs], ["A", "A"])
+        self.assertTrue(v_segs[1].valley_dip_before)
+
+        sched = keyframe_gen.schedule_keyframes(
+            v_segs, {"A": "あ"}, {"A": 1.0}, start_frame=1, max_mouth_open=1.0,
+            min_phoneme_frames=3, transition_frames=2, co_articulation=0.25, preserve_syllables=False,
+        )
+        vals = [ev.value for ev in sched["あ"]]
+        self.assertTrue(any(0.1 < v < 0.65 for v in vals), f"Expected valley dip in Mode A, got {vals}")
+
+    def test_energy_scale_percentile_resists_single_loud_outlier(self):
+        # One -10 dB spike among normal -20..-22 dB syllables must not crush them down to 0.65.
+        syllables = [
+            AlignedSyllable("A", 1.0, 4.0, -10.0, False),
+            AlignedSyllable("I", 5.0, 8.0, -20.0, False),
+            AlignedSyllable("U", 9.0, 12.0, -21.0, False),
+            AlignedSyllable("E", 13.0, 16.0, -20.5, False),
+            AlignedSyllable("O", 17.0, 20.0, -21.5, False),
+            AlignedSyllable("A", 21.0, 24.0, -28.0, False),
+        ]
+        scales = keyframe_gen._compute_energy_scales(syllables)
+        self.assertGreater(scales[1], 0.90)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -511,6 +511,59 @@ class TestAudioDsp(unittest.TestCase):
         self.assertAlmostEqual(frame.f2, 2300.0, delta=60.0)
         self.assertEqual(frame.vowel, "I")
 
+    def test_pitch_fundamental_rejection_english_ae_and_consonant_burst_guard(self):
+        sr = 16000
+        dur = 0.25
+        t = np.arange(int(sr * dur), dtype=np.float64) / sr
+
+        # Strong 220 Hz voice fundamental alongside female /i/ and /u/ formants must not hijack F1.
+        for expected_vowel, (f1, f2) in (("I", (340.0, 2500.0)), ("U", (370.0, 860.0))):
+            sig = (
+                0.95 * np.sin(2.0 * np.pi * 220.0 * t)
+                + 0.25 * np.sin(2.0 * np.pi * f1 * t)
+                + 0.18 * np.sin(2.0 * np.pi * f2 * t)
+            ).astype(np.float32)
+            frames = audio_dsp.analyze_audio_frames(
+                sig, sr=sr, silence_threshold_db=-38.0, voice_type="FEMALE_STANDARD", language="ENGLISH"
+            )
+            mid_frames = frames[3:-3]
+            self.assertTrue(all(f.is_voiced for f in mid_frames))
+            self.assertTrue(all(f.f1 >= 265.0 for f in mid_frames))
+            vowels = [f.vowel for f in mid_frames]
+            self.assertEqual(max(set(vowels), key=vowels.count), expected_vowel)
+
+        # English front-open /ae/ ("fast", "can") must classify as open A rather than mid-front E.
+        for f1, f2 in ((860.0, 1820.0), (840.0, 1960.0), (960.0, 1740.0)):
+            ae_sig = (0.45 * np.sin(2.0 * np.pi * f1 * t) + 0.30 * np.sin(2.0 * np.pi * f2 * t)).astype(
+                np.float32
+            )
+            ae_frames = audio_dsp.analyze_audio_frames(
+                ae_sig, sr=sr, silence_threshold_db=-38.0, voice_type="FEMALE_STANDARD", language="ENGLISH"
+            )
+            ae_vowels = [f.vowel for f in ae_frames[3:-3] if f.is_voiced and f.vowel]
+            self.assertEqual(max(set(ae_vowels), key=ae_vowels.count), "A")
+
+        # High consonant burst lacking any vocal-tract F1 resonance below 1250 Hz stays unvoiced.
+        high_burst = (
+            0.35 * np.sin(2.0 * np.pi * 1950.0 * t) + 0.25 * np.sin(2.0 * np.pi * 2750.0 * t)
+        ).astype(np.float32)
+        burst_frames = audio_dsp.analyze_audio_frames(
+            high_burst, sr=sr, silence_threshold_db=-38.0, voice_type="FEMALE_STANDARD", language="ENGLISH"
+        )
+        self.assertTrue(all(not f.is_voiced for f in burst_frames))
+
+        # Single-hop vowel glitch inside a steady /o/ run is suppressed by temporal smoothing.
+        steady_t = np.arange(int(sr * 0.12), dtype=np.float64) / sr
+        o_block = (0.45 * np.sin(2.0 * np.pi * 550.0 * steady_t) + 0.30 * np.sin(2.0 * np.pi * 925.0 * steady_t))
+        glitch_t = np.arange(int(sr * 0.008), dtype=np.float64) / sr
+        glitch = (0.45 * np.sin(2.0 * np.pi * 330.0 * glitch_t) + 0.30 * np.sin(2.0 * np.pi * 2300.0 * glitch_t))
+        joined = np.concatenate([o_block, glitch, o_block]).astype(np.float32)
+        sm_frames = audio_dsp.analyze_audio_frames(
+            joined, sr=sr, silence_threshold_db=-38.0, voice_type="FEMALE_STANDARD", language="INDONESIAN"
+        )
+        mid_vowels = [f.vowel for f in sm_frames[3:-3] if f.is_voiced and f.vowel]
+        self.assertTrue(all(v == "O" for v in mid_vowels), f"Expected smoothed O run, got {mid_vowels}")
+
 
 if __name__ == "__main__":
     unittest.main()

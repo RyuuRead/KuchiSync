@@ -255,6 +255,33 @@ class TestTranscriptAlign(unittest.TestCase):
         self.assertEqual([s.vowel for s in eng_aligned], ["A", "I"])
         self.assertEqual(norm_spy.call_args.kwargs.get("language"), "ENGLISH")
 
+    def test_phrase_matching_prefers_long_pause_and_avoids_one_hop_collapse(self):
+        sr = 16000
+        # Phrase 1 ("ha na"): 0.50s; long break: 0.90s; Phrase 2 ("si ku te") split by a 0.16s stop closure.
+        p1 = np.concatenate([
+            _synth_formant_tone(780.0, 1300.0, 0.25, sr=sr),
+            _synth_formant_tone(820.0, 1280.0, 0.25, sr=sr),
+        ])
+        long_pause = np.zeros(int(sr * 0.90), dtype=np.float32)
+        p2a = _synth_formant_tone(330.0, 2300.0, 0.12, sr=sr)
+        short_stop = np.zeros(int(sr * 0.16), dtype=np.float32)
+        p2b = np.concatenate([
+            _synth_formant_tone(365.0, 840.0, 0.12, sr=sr),
+            _synth_formant_tone(540.0, 1950.0, 0.14, sr=sr),
+            _synth_formant_tone(780.0, 1300.0, 0.14, sr=sr),
+        ])
+        audio = np.concatenate([p1, long_pause, p2a, short_stop, p2b]).astype(np.float32)
+
+        aligned = transcript_align.align_transcript(
+            audio, sr, "ha na, si ku te ka", "INDONESIAN", silence_threshold_db=-38.0, fps=24.0, start_frame=1
+        )
+        self.assertEqual([s.vowel for s in aligned], ["A", "A", "I", "U", "E", "A"])
+        # Phrase 1's two vowels stay before the 0.90s break (~0.50s = frame 13); phrase 2 starts after (~frame 34).
+        self.assertLess(aligned[1].end_frame, 16.0)
+        self.assertGreater(aligned[2].start_frame, 30.0)
+        for syl in aligned:
+            self.assertGreaterEqual(syl.end_frame - syl.start_frame, 0.45)
+
 
 if __name__ == "__main__":
     unittest.main()
