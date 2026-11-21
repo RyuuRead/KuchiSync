@@ -1022,11 +1022,11 @@ if bpy is not None:
             return {"FINISHED"}
 
     class _KuchiSyncBasePanel(bpy.types.Panel):
-        """Shared panel location metadata for View3D > UI > LipSync."""
+        """Shared panel location metadata for View3D > UI > KuchiSync."""
 
         bl_space_type = "VIEW_3D"
         bl_region_type = "UI"
-        bl_category = "LipSync"
+        bl_category = "KuchiSync"
 
         @classmethod
         def poll(cls, context) -> bool:

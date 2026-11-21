@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "kuchisync"
-version = "1.0.0"
+version = "0.2.0"
 name = "KuchiSync"
 tagline = "Sparse A-I-U-E-O Shape Key lip-sync from audio and transcripts"
 maintainer = "RyuuRead <mahlimalilham@outlook.com>"
