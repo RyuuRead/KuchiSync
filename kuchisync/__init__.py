@@ -7,9 +7,9 @@ import sys
 bl_info = {
     "name": "KuchiSync",
     "author": "RyuuRead",
-    "version": (1, 0, 0),
+    "version": (0, 2, 0),
     "blender": (4, 4, 0),
-    "location": "View3D > UI > LipSync",
+    "location": "View3D > UI > KuchiSync",
     "description": "Sparse A-I-U-E-O Shape Key lip-sync from audio and transcripts",
     "category": "Animation",
 }

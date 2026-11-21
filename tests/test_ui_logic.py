@@ -544,7 +544,7 @@ class TestUiLogicAndHygiene(unittest.TestCase):
                 for p_cls in panel_classes:
                     self.assertEqual(p_cls.bl_space_type, "VIEW_3D")
                     self.assertEqual(p_cls.bl_region_type, "UI")
-                    self.assertEqual(p_cls.bl_category, "LipSync")
+                    self.assertEqual(p_cls.bl_category, "KuchiSync")
 
                 self.assertTrue(hasattr(bpy_mod.types.Scene, "kuchisync"))
                 settings_cls = next(c for c in registered if c.__name__ == "KuchiSyncSettings")
