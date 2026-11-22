@@ -36,27 +36,6 @@ Modular Blender add-on and extension for **A-I-U-E-O** Shape Key lip-sync animat
 4. Choose your dialogue audio file (`.wav`, `.mp3`, `.ogg`, `.flac`) and `Language` (`Indonesian` or `English`).
 5. Pick **Pure Audio (Formant)** or **Audio + Transcript**, adjust **Animation & Curve Refinement**, and click **Generate Auto Lip-Sync**.
 
-## Development & Tests
-
-Run the unit test suite:
-
-```bash
-python3 -W error -m unittest discover -s tests -p "test_*.py" -v
-```
-
-Build the extension ZIP:
-
-```bash
-python3 scripts/package_addon.py
-```
-
-Run headless verification inside Blender:
-
-```bash
-blender -b --factory-startup --command extension validate dist/kuchisync.zip
-blender -b --factory-startup --python-exit-code 1 --python tests/blender_smoke_test.py
-```
-
 ## Changelog
 
 ### b1.0 (from a0.2)
