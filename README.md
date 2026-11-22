@@ -2,7 +2,7 @@
 
 Modular Blender add-on and extension for **A-I-U-E-O** Shape Key lip-sync animation from speech audio or audio paired with a text transcript.
 
-## Compatibility
+## Tested In
 
 - **Blender 4.4.3** (including Goo Engine)
 - **Blender 4.5 LTS**
